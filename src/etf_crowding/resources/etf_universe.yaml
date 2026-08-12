@@ -1,0 +1,88 @@
+etfs:
+  # Broad Market
+  - ticker: SPY
+    name: SPDR S&P 500 ETF Trust
+    category: Broad Market
+  - ticker: QQQ
+    name: Invesco QQQ Trust
+    category: Broad Market
+  - ticker: IWM
+    name: iShares Russell 2000 ETF
+    category: Broad Market
+  - ticker: DIA
+    name: SPDR Dow Jones Industrial Average ETF Trust
+    category: Broad Market
+  - ticker: VTI
+    name: Vanguard Total Stock Market ETF
+    category: Broad Market
+
+  # Technology / Growth
+  - ticker: XLK
+    name: Technology Select Sector SPDR Fund
+    category: Technology / Growth
+  - ticker: VGT
+    name: Vanguard Information Technology ETF
+    category: Technology / Growth
+  - ticker: SMH
+    name: VanEck Semiconductor ETF
+    category: Technology / Growth
+  - ticker: SOXX
+    name: iShares Semiconductor ETF
+    category: Technology / Growth
+  - ticker: IGV
+    name: iShares Expanded Tech-Software Sector ETF
+    category: Technology / Growth
+
+  # Financials
+  - ticker: XLF
+    name: Financial Select Sector SPDR Fund
+    category: Financials
+  - ticker: KRE
+    name: SPDR S&P Regional Banking ETF
+    category: Financials
+
+  # Energy
+  - ticker: XLE
+    name: Energy Select Sector SPDR Fund
+    category: Energy
+  - ticker: XOP
+    name: SPDR S&P Oil & Gas Exploration & Production ETF
+    category: Energy
+
+  # Healthcare
+  - ticker: XLV
+    name: Health Care Select Sector SPDR Fund
+    category: Healthcare
+  - ticker: XBI
+    name: SPDR S&P Biotech ETF
+    category: Healthcare
+
+  # Consumer
+  - ticker: XLY
+    name: Consumer Discretionary Select Sector SPDR Fund
+    category: Consumer
+  - ticker: XLP
+    name: Consumer Staples Select Sector SPDR Fund
+    category: Consumer
+
+  # Industrials / Materials
+  - ticker: XLI
+    name: Industrial Select Sector SPDR Fund
+    category: Industrials / Materials
+  - ticker: XLB
+    name: Materials Select Sector SPDR Fund
+    category: Industrials / Materials
+
+  # Thematic
+  - ticker: ARKK
+    name: ARK Innovation ETF
+    category: Thematic
+  - ticker: TAN
+    name: Invesco Solar ETF
+    category: Thematic
+  - ticker: ICLN
+    name: iShares Global Clean Energy ETF
+    category: Thematic
+  - ticker: LIT
+    name: Global X Lithium & Battery Tech ETF
+    category: Thematic
