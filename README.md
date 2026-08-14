@@ -62,8 +62,9 @@ applied retroactively because that would introduce look-ahead bias. Definitions,
 alignment rules, and limitations are documented in
 [`docs/methodology.md`](docs/methodology.md).
 
-No factor calculations, weights, thresholds, scores, or empirical conclusions
-have been implemented yet.
+The historical daily price-ingestion layer is implemented, but no factor
+calculations, weights, thresholds, scores, or empirical conclusions have been
+implemented yet.
 
 ## Planned project architecture
 
@@ -95,31 +96,178 @@ root and never creates directories automatically.
 The packaged ETF universe is independent of repository path resolution and
 continues to load through `importlib.resources` in installed distributions.
 
-## Planned technology stack
+## Price-data pipeline
+
+Day 2 adds an offline-tested historical daily price pipeline backed by
+`yfinance` and Yahoo Finance. The command-line workflow loads all tickers through
+the canonical packaged ETF-universe configuration, requests each ticker
+independently, normalizes successful responses, validates the combined history,
+and writes the canonical Parquet dataset to
+`data/processed/etf_prices_daily.parquet`.
+
+Run an update from the repository root after installing the project:
+
+```text
+.venv\Scripts\python.exe scripts\update_prices.py
+```
+
+The default date window starts on `2018-01-01` and uses the current
+America/New_York calendar date as the exclusive end bound, matching the
+documented `yfinance` interface. Therefore, the default request includes only
+observations strictly before the current U.S. market calendar date. It does not
+attempt to determine market-close status or consult a trading calendar. Explicit
+end dates preserve the same exclusive semantics. Explicit bounds and a
+controlled destination are also available:
+
+```text
+.venv\Scripts\python.exe scripts\update_prices.py --start 2024-01-01 --end 2024-02-01 --output data/processed/etf_prices_daily.parquet
+```
+
+Every usable normalized observation returned for a ticker must fall within the
+requested inclusive-start, exclusive-end interval. A response containing any
+out-of-window date is rejected for that ticker rather than silently trimmed.
+Raw chart timestamps are converted using the response's exchange timezone, and
+the resulting market dates are normalized without a timezone-induced date
+shift. Any injected non-empty provider DataFrame must expose a pandas
+`DatetimeIndex`; numeric or other malformed indexes are rejected instead of
+being coerced into dates. Supplied `Open`, `High`, `Low`, `Close`, `Adj Close`,
+and `Volume` columns must already have real numeric pandas dtypes before
+normalization. Boolean, complex, string, object, datetime, timedelta,
+categorical, and other non-real-numeric provider dtypes are rejected for that
+ticker rather than coerced into plausible market values.
+Provider exceptions are surfaced through yfinance's supported
+`config.debug.hide_exceptions` setting so failures remain distinguishable from a
+genuinely empty history. The pipeline restores the prior setting after each
+request.
+
+The provider boundary is currently inspected and tested specifically against
+`yfinance==1.5.2`. Its public `Ticker.history()` output does not retain all
+source missingness needed here, so a small isolated adapter uses the pinned
+yfinance-owned uncached `Ticker._data.get` chart transport for every
+source-vintage retrieval. This preserves yfinance's session, authentication,
+cookie/crumb, retry, error, and rate-limit handling without introducing a
+project HTTP client. The adapter deliberately bypasses yfinance's in-process
+response cache because it provides neither a source retrieval timestamp nor a
+TTL suitable for the latest-vintage policy. Repeated identical historical
+requests may therefore make another provider request; this is an intentional
+correctness-over-performance choice. For normal live ingestion, the project
+captures `retrieved_at` immediately after each successful ticker response
+returns and before canonical normalization. Tickers in one batch may therefore
+have different timestamps. This remains a client-side retrieval timestamp, not
+a Yahoo server-side revision timestamp. A timezone-aware explicit
+`retrieved_at` is available as a deterministic caller override, but is not the
+normal concurrent live-ingestion policy. This is a deliberate private-interface
+dependency. Provider upgrades require source review and offline integration-test
+updates before changing that exact pin.
+
+### Canonical daily price schema
+
+| Column | Definition |
+| --- | --- |
+| `date` | Timezone-naive, normalized market observation date |
+| `ticker` | Configured ETF ticker |
+| `open` | Yahoo/yfinance source historical daily open |
+| `high` | Yahoo/yfinance source historical daily high |
+| `low` | Yahoo/yfinance source historical daily low |
+| `close` | Yahoo/yfinance source historical daily close |
+| `adjusted_close` | Raw chart adjusted-close value when supplied for that observation |
+| `volume` | Raw chart daily volume, preserving source null versus explicit zero |
+| `retrieved_at` | UTC client-side timestamp captured after that ticker response returns |
+
+Canonical column labels must be unique. Every canonical market column (`open`,
+`high`, `low`, `close`, `adjusted_close`, and `volume`) must already have a real
+numeric pandas dtype. Boolean, complex, string, object, datetime, timedelta,
+categorical, and other non-real-numeric dtypes are rejected before persistence;
+they are never converted into plausible market values.
+
+The adapter reads Yahoo chart quote arrays before yfinance's high-level history
+transformations, so no `Adj Close / Close` automatic OHLC adjustment or back
+adjustment is applied, preserving the Day 2 `auto_adjust=False` and
+`back_adjust=False` methodology. These Yahoo/yfinance source historical OHLC
+values must not be described as guaranteed nominal or raw historical tape
+prices: Yahoo's source series may already reflect split-related historical
+adjustments or later provider revisions.
+
+yfinance 1.5.2's high-level history processing can synthesize `Adj Close` from
+`Close` when the raw adjusted-close indicator is absent and can replace missing
+volume with zero. Canonical missingness is therefore derived from the raw Yahoo
+chart values, not solely from the post-processed history DataFrame.
+`adjusted_close` is populated only when the raw adjusted-close indicator supplies
+that observation; it is never fabricated from `close`. A raw volume null remains
+missing, while an explicit raw zero remains zero. Future total-return or momentum
+calculations should continue to use appropriately adjusted prices. Day 2 does
+not implement those calculations.
+
+Individual market fields may remain missing and are never forward-filled or
+backfilled. A ticker/date row with all six market fields missing has no usable
+market observation. Raw dated rows remain visible through normalization and are
+rejected rather than filled, zeroed, or silently dropped. One ticker's empty
+response or provider failure does not discard
+successful tickers: the CLI reports a partial batch clearly and persists only
+valid observations. If every ticker is empty or failed, the command exits with
+an error and does not replace existing history.
+
+The canonical Parquet file represents the latest successfully validated
+Yahoo/yfinance source vintage available to the pipeline. Repeated updates retain
+identical overlapping rows once and do not treat retrieval-time differences as
+revisions. A newer whole-row source vintage may complete previously missing
+fields or revise existing market values. The pipeline does not infer whether a
+revision arose from a dividend, split, other corporate action, Yahoo correction,
+or another provider change.
+
+For a changed overlapping ticker/date row, the incoming `retrieved_at` must be
+later than the canonical row's timestamp. An older incoming vintage is rejected;
+different values with the same timestamp are also rejected as inconsistent.
+Identical market fields remain a no-op regardless of timestamp and retain the
+existing canonical row and provenance.
+
+Before revised overlapping rows replace the canonical values, the exact
+superseded canonical Parquet is preserved under `data/snapshots/prices/` with a
+collision-safe UTC timestamp. The revision is reported by row count and affected
+ticker. If snapshot preservation fails, the canonical file remains unchanged.
+An incoming overlap that loses a previously available market value is rejected
+for manual review rather than erasing data or mixing fields from different
+source vintages. Non-requested, empty, or failed tickers retain their existing
+history. A deterministic adjacent lock file serializes each canonical output's
+complete existing-file read, validation, merge, required snapshot, and atomic
+replacement transaction. Lock acquisition times out clearly after 30 seconds;
+unrelated custom output paths use independent locks. The lock file is only
+coordination metadata and is not a market dataset. Generated processed data and
+snapshots are ignored by Git.
+
+Market-data coverage, field availability, adjustment calculations, revisions,
+rate limits, and service continuity depend on yfinance and Yahoo Finance. This
+third-party dataset should not be treated as an exchange-authoritative record.
+
+## Technology stack
 
 - Python 3.12
 - pandas, NumPy, SciPy, and statsmodels for data and statistical work
-- yfinance as an anticipated third-party market-data interface
+- yfinance 1.5.2 as the pinned third-party historical price-data interface
 - PyYAML and PyArrow for configuration and data storage
 - Plotly and Streamlit for the planned public application
 - pytest, Ruff, and mypy for quality checks
 
 ## Current development status
 
-Day 1 establishes the repository layout, packaging and tool configuration, ETF
-universe configuration, configuration validation, methodology documentation,
-and offline unit tests. Market-data downloads, factor calculations, crowding
-scores, backtests, notebooks with analysis, and Streamlit pages are not yet
-implemented.
+Day 1 established the repository layout, packaging and tool configuration,
+canonical ETF-universe configuration, configuration validation, methodology
+documentation, and offline unit tests. Day 2 implements the historical daily
+price download, normalization, validation, incremental Parquet persistence, and
+command-line update workflow. Shares-outstanding history, flow proxies,
+holdings, concentration, momentum, volatility, crowding scores, backtests,
+analysis case studies, and Streamlit pages are not yet implemented.
 
 ## Data limitations
 
-Anticipated limitations include survivorship bias from the present-day curated
-universe, incomplete shares-outstanding history, the difference between a flow
-proxy and reported flows, lack of historical point-in-time holdings, third-party
-data availability, revisions, and missing observations. Missing data will not be
-silently invented or forward-filled. Availability timing and provenance will be
-documented as data pipelines are added.
+Limitations include survivorship bias from the present-day curated universe,
+third-party price-data availability and revisions, missing price observations,
+anticipated incomplete shares-outstanding history, the difference between a
+future flow proxy and reported flows, and lack of historical point-in-time
+holdings. Missing data are not silently invented or forward-filled. Each price
+row records the client-side retrieval time of its ticker response, but Yahoo
+Finance does not provide an exchange-authoritative publication timestamp for
+every historical observation.
 
 ## Installation
 
@@ -138,7 +286,7 @@ On macOS or Linux, activate the environment with
 requirements.txt` installs the same production and development dependency sets
 without installing the local package.
 
-## Planned testing commands
+## Testing commands
 
 Run the configured quality gates from the repository root:
 
