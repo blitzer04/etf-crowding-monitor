@@ -2,12 +2,12 @@
 
 ## Scope and status
 
-This document describes the implemented price-data foundation and intended
-research design for the U.S. ETF Crowding & Overheating Risk Monitor. Historical
-daily price ingestion is implemented. No empirical factor calculations, scores,
-thresholds, backtests, or conclusions exist at this stage. Exact definitions,
-units, transformations, date alignment, and missing-data rules will be specified
-and tested before any factor is presented as a result.
+This document describes the implemented price and shares-outstanding data
+foundations and intended research design for the U.S. ETF Crowding & Overheating
+Risk Monitor. No flow proxy, empirical factor calculations, scores, thresholds,
+backtests, or conclusions exist at this stage. Exact definitions, units,
+transformations, date alignment, and missing-data rules will be specified and
+tested before any factor is presented as a result.
 
 The framework is intended to monitor unusual combinations of risk indicators.
 It is not intended to predict crashes or provide a trading signal.
@@ -114,10 +114,13 @@ pipeline.
 
 Present prices must be finite and positive, present volume must be finite and
 non-negative, and available OHLC values must satisfy basic range relationships.
-Canonical column labels must be unique, and all six market columns must use real
-numeric pandas dtypes. Boolean, complex, string, object, datetime, timedelta,
-categorical, and other non-real-numeric dtypes are invalid before Parquet
-serialization. Values are not inspected or coerced to rescue a malformed dtype.
+Canonical column labels must be unique, and all six market columns must use
+supported dense real numeric integer or floating pandas dtypes from NumPy,
+nullable pandas, or PyArrow-backed representations. Pandas SparseDtype and
+PyArrow decimal are currently unsupported. Boolean, complex, string, object,
+datetime, timedelta, categorical, sparse, decimal, and other unsupported dtypes
+are invalid before Parquet serialization. Values are not inspected or coerced
+to rescue an unsupported dtype.
 Individual missing market fields are preserved; observations are never
 forward-filled, backfilled, or invented. Every ticker/date row must contain at
 least one of `open`, `high`, `low`, `close`, `adjusted_close`, or `volume`. A row
@@ -127,13 +130,18 @@ remains a genuine empty response rather than a validation failure.
 
 The canonical `data/processed/etf_prices_daily.parquet` file represents the
 latest successfully validated Yahoo/yfinance source vintage available to this
-pipeline. Exact duplicate observations within one incoming dataset may be
-retained once; conflicting duplicates within that dataset remain invalid.
-Incremental persistence compares each validated incoming row with the existing
-row for the same ticker/date:
+pipeline. For each persisted ticker/date row, `retrieved_at` is the latest
+client-side retrieval time at which the project observed the currently stored
+six market fields. It is not a Yahoo publication or revision timestamp. Exact
+duplicate observations within one incoming dataset retain the row with the
+latest retrieval time; conflicting duplicates remain invalid. Incremental
+persistence compares each validated incoming row with the existing row for the
+same ticker/date:
 
-- Identical market fields retain one existing row; a different `retrieved_at`
-  alone is not a revision.
+- Identical market fields retain the existing financial values. A later
+  incoming `retrieved_at` advances only the canonical provenance watermark; an
+  older or equal timestamp leaves it unchanged. This is not a source-value
+  revision.
 - If incoming data complete previously missing market fields without losing any
   existing values, or if market values differ, the entire validated incoming
   row becomes the latest source vintage only when its row-level `retrieved_at`
@@ -154,19 +162,149 @@ previous Parquet representation is atomically preserved under
 overwritten. Failure to preserve the snapshot aborts before the canonical file
 changes. Accepted revisions are surfaced by revised-row count and affected
 ticker, and revised canonical rows use the incoming response's `retrieved_at`.
-Identical repeated writes do not create snapshots. The validated latest-vintage
-canonical write remains atomic. An adjacent cross-process file lock, scoped to
-the canonical output path, covers the entire existing-file read, validation,
-merge, snapshot, and replacement transaction. Acquisition fails after a
-30-second timeout rather than waiting indefinitely. The persistent lock file is
-coordination metadata, not financial data; custom output paths do not share a
-global lock.
+Provenance-only watermark advancement atomically rewrites the canonical file but
+does not create a snapshot because no market value is superseded. The validated
+latest-vintage canonical write remains atomic. An adjacent cross-process file
+lock, scoped to the canonical output path, covers the entire existing-file read,
+validation, merge, snapshot, and replacement transaction. Acquisition fails
+after a 30-second timeout rather than waiting indefinitely. The persistent lock
+file is coordination metadata, not financial data; custom output paths do not
+share a global lock.
 
 The batch records successful, empty, and failed tickers separately. A partial
 batch may persist valid ticker results only after the CLI reports that it is
 partial; existing history for failed, empty, or otherwise unrequested tickers is
 not deleted. An entirely empty or failed batch cannot replace an existing
 canonical file.
+
+## Historical shares outstanding
+
+### Source and verified interface
+
+Day 3 uses the public `Ticker.get_shares_full(start=None, end=None)` interface
+found in the installed `yfinance==1.5.2` source. That implementation requests
+the Yahoo fundamentals-timeseries path for its `shares_out` field and returns a
+pandas `Series`. Its index is formed by parsing source timestamps and localizing
+them to the ticker's exchange timezone. The method has no detailed docstring, so
+the endpoint schema and parsing behavior are treated as private,
+version-specific implementation details rather than a stable provider promise.
+
+The high-level implementation calls yfinance's non-expiring `cache_get` and can
+return `None` for both absent shares history and some suppressed request errors.
+Those behaviors do not provide sufficient source-vintage or failure provenance.
+The isolated Day 3 adapter therefore mirrors the inspected yfinance 1.5.2
+fundamentals-timeseries request and parser while calling the yfinance-owned
+uncached `Ticker._data.get` transport. This keeps yfinance responsible for its
+session, authentication, cookie/crumb, configured retries, HTTP behavior, and
+rate-limit errors. No independent project HTTP client or retry loop is used.
+
+Tests use injected Series and raw payload fixtures only. No live Yahoo request
+was made while implementing or testing Day 3, so actual ETF coverage,
+historical depth, observation cadence, revision patterns, missingness patterns,
+and current raw payload behavior remain unverified. Provider upgrades require
+source inspection and contract-test review before the yfinance pin or adapter
+changes.
+
+### Query bounds and observation dates
+
+The inspected yfinance implementation accepts optional `start` and `end`
+arguments. The project preserves its inspected construction while resolving an
+omitted end from one client-side batch reference instant, captured before any
+ticker request. That same instant is converted independently into each ticker's
+exchange timezone. This prevents request duration, ordering, or an intervening
+exchange-local midnight from changing later tickers' wall-clock reference. When
+`start` is omitted it remains 548 days before that ticker's resolved end. The
+adapter floors the resolved start day, ceils the end day, and sends both as
+`period1` and `period2`. The implementation neither documents exact
+inclusive/exclusive response semantics nor filters the returned Series to a
+locally enforced interval. Accordingly, Day 3 describes these values only as
+provider query bounds, not as a canonical `[start, end)` rule, and does not
+silently trim an observation that the provider returns.
+
+The canonical `date` is the source observation date represented by yfinance's
+exchange-local index. Day 3 removes the timezone without converting the instant
+to another timezone, then normalizes the local calendar date to midnight. This
+prevents an unintended calendar shift while preserving the installed
+implementation's date interpretation.
+
+The source Series is not assumed to be genuinely daily. Only returned source
+dates are stored. Day 3 does not expand sparse observations onto trading days,
+align them to ETF price history, create weekend or holiday records, interpolate,
+forward-fill, or backfill. Any later creation/redemption flow-proxy methodology
+must define its observation alignment independently and point in time.
+
+### Canonical schema and validation
+
+The processed file is
+`data/processed/etf_shares_outstanding.parquet` with exactly these fields:
+
+| Field | Unit and interpretation |
+| --- | --- |
+| `date` | Timezone-naive normalized source observation date |
+| `ticker` | Requested ETF ticker |
+| `shares_outstanding` | Provider `shares_out` observation, in shares |
+| `retrieved_at` | UTC client-side retrieval timestamp captured after that ticker response returns |
+
+`retrieved_at` is this project's observation time, not a Yahoo publication or
+revision timestamp. Normal live retrieval timestamps each returned ticker
+response separately. An explicit timezone-aware override exists for
+deterministic offline use and is not the normal concurrent ingestion policy.
+
+The installed yfinance method builds its Series from all paired timestamps and
+`shares_out` values without dropping null values. Day 3 therefore treats a dated
+null as meaningful source missingness and retains that row. A response with no
+dated Series is instead classified as genuinely empty. Missing shares remain
+missing even if every dated row in a ticker response is null; they are never
+converted to zero or filled.
+
+The provider boundary requires a real numeric pandas dtype for shares. The
+canonical validator supports dense integer and floating dtypes from NumPy,
+pandas nullable, and PyArrow-backed representations; pandas SparseDtype and
+PyArrow decimal are currently unsupported. Boolean, complex, string, object,
+datetime, timedelta, categorical, and other unsupported dtypes are rejected
+before conversion or Parquet serialization. Present shares values must be
+finite and strictly positive. Missing values within supported nullable integer
+or floating dtypes are valid. Column labels must be unique, tickers nonblank,
+dates normalized and valid, and retrieval timestamps timezone-aware UTC. Exact
+duplicate ticker/date observations with the same shares value retain the row
+with the latest retrieval timestamp deterministically; conflicting duplicate
+values are invalid.
+
+### Source vintages and persistence
+
+The canonical file represents the latest successfully validated shares source
+vintage observed by this project. For each persisted ticker/date row,
+`retrieved_at` is the latest client-side retrieval time at which the project
+observed the currently stored shares value; it remains neither a Yahoo
+publication timestamp nor a Yahoo revision timestamp:
+
+- Identical overlapping shares values retain the existing source value. A later
+  incoming `retrieved_at` advances only the canonical provenance watermark; an
+  older or equal timestamp leaves it unchanged.
+- A changed shares value or missing-to-present completion replaces the entire
+  row only when the incoming `retrieved_at` is later.
+- A changed older vintage is rejected as stale. Different values with the same
+  `retrieved_at` are rejected as inconsistent.
+- An incoming missing value cannot erase a previously present shares value.
+  That value loss is rejected for manual review rather than silently accepted.
+- Failed, empty, and unrequested tickers retain their prior canonical history.
+
+Before an accepted revision changes the canonical file, the exact superseded
+Parquet is atomically published under `data/snapshots/shares/` with a
+collision-safe UTC name. Snapshot failure leaves canonical history unchanged.
+Provenance-only watermark advancement atomically rewrites the canonical file but
+does not create a snapshot because no shares value is superseded.
+An adjacent cross-process lock scoped to each output path serializes the entire
+existing-file read, validation, merge, snapshot, and atomic replacement
+transaction. Lock acquisition fails clearly after 30 seconds. Custom outputs
+use independent locks.
+
+Shares outstanding are the provider's count of ETF shares represented by this
+source. They are not trading volume, assets under management, NAV, fund flow, or
+creation/redemption activity. Day 3 calculates no creation/redemption flow
+proxy. A later methodology may estimate such a proxy from changes in shares,
+but must define the formula, units, timing, sparse-date alignment, and
+limitations separately.
 
 ## Planned live factors
 
@@ -287,9 +425,10 @@ an exchange-authoritative historical publication time from the provider output.
 ### Missing observations
 
 Prices, shares outstanding, and holdings may be missing or stale on particular
-dates. The price pipeline preserves missing market fields and does not fill
-absent trading observations. Future factor methodology must define minimum
-coverage and exclusion rules without fabricating observations.
+dates. The price and shares pipelines preserve source missingness and do not
+fill absent observations. Shares history may be sparse and is not expanded to
+the price calendar. Future factor methodology must define minimum coverage,
+alignment, and exclusion rules without fabricating observations.
 
 These are anticipated research constraints, not empirical findings. Their actual
 impact cannot be assessed until data ingestion and analysis are implemented.

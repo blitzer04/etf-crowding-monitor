@@ -6,6 +6,10 @@ import numpy as np
 import pandas as pd
 from pandas.api.types import is_any_real_numeric_dtype, is_datetime64_dtype
 
+from etf_crowding.data.numeric_dtypes import (
+    is_supported_canonical_numeric_dtype,
+)
+
 CANONICAL_PRICE_COLUMNS = (
     "date",
     "ticker",
@@ -62,17 +66,77 @@ def _key_examples(data: pd.DataFrame, invalid: pd.Series, limit: int = 5) -> str
     return examples.to_dict(orient="records").__repr__()
 
 
-def _numeric_columns(data: pd.DataFrame) -> dict[str, pd.Series]:
+def _prevalidate_price_structure_and_dtypes(
+    data: pd.DataFrame,
+) -> dict[str, pd.Series]:
+    _validate_columns(data)
     numeric_columns: dict[str, pd.Series] = {}
-
     for column in PRICE_VALUE_COLUMNS:
         values = data[column]
-        if not is_any_real_numeric_dtype(values.dtype):
+        if not is_supported_canonical_numeric_dtype(values.dtype):
+            if is_any_real_numeric_dtype(values.dtype):
+                raise PriceDataValidationError(
+                    f"Column '{column}' uses unsupported real numeric dtype "
+                    f"{values.dtype}; canonical prices support dense integer "
+                    "and floating pandas, NumPy, and PyArrow-backed dtypes only."
+                )
             raise PriceDataValidationError(
-                f"Column '{column}' must have a real numeric dtype; "
+                f"Column '{column}' must have a real numeric dtype using a "
+                "supported dense integer or floating representation; "
                 f"received {values.dtype}."
             )
+        numeric_columns[column] = values
+    return numeric_columns
 
+
+def _validate_retrieval_timestamps(data: pd.DataFrame) -> None:
+    retrieval_dtype = data["retrieved_at"].dtype
+    if not isinstance(retrieval_dtype, pd.DatetimeTZDtype):
+        raise PriceDataValidationError(
+            "Column 'retrieved_at' must have a timezone-aware datetime64 dtype."
+        )
+    if str(retrieval_dtype.tz) != "UTC":
+        raise PriceDataValidationError("Retrieval timestamps must use UTC.")
+    if data["retrieved_at"].isna().any():
+        raise PriceDataValidationError(
+            "Retrieval timestamps must not be missing or invalid."
+        )
+
+
+def _validate_canonical_keys(data: pd.DataFrame) -> None:
+    if isinstance(data["date"].dtype, pd.DatetimeTZDtype) or not is_datetime64_dtype(
+        data["date"].dtype
+    ):
+        raise PriceDataValidationError(
+            "Column 'date' must have a timezone-naive datetime64 dtype."
+        )
+
+    invalid_ticker = pd.Series(
+        [
+            not isinstance(value, str) or not value.strip()
+            for value in data["ticker"].array
+        ],
+        index=data.index,
+        dtype=bool,
+    )
+    if invalid_ticker.any():
+        examples = data.loc[invalid_ticker, "ticker"].head(5).tolist()
+        raise PriceDataValidationError(
+            f"Ticker values must be non-empty strings; invalid values: {examples}."
+        )
+
+    if data["date"].isna().any():
+        raise PriceDataValidationError("Price dates must not be missing or invalid.")
+    if data["date"].ne(data["date"].dt.normalize()).any():
+        raise PriceDataValidationError(
+            "Price dates must be normalized to midnight without intraday times."
+        )
+
+
+def _numeric_columns(data: pd.DataFrame) -> dict[str, pd.Series]:
+    numeric_columns = _prevalidate_price_structure_and_dtypes(data)
+
+    for column, values in numeric_columns.items():
         finite_values = pd.Series(
             np.isfinite(values), index=data.index, dtype="boolean"
         ).fillna(False)
@@ -82,8 +146,6 @@ def _numeric_columns(data: pd.DataFrame) -> dict[str, pd.Series]:
                 f"Column '{column}' contains non-finite values at "
                 f"{_key_examples(data, non_finite)}."
             )
-
-        numeric_columns[column] = values
 
     return numeric_columns
 
@@ -125,12 +187,13 @@ def validate_price_data(data: pd.DataFrame) -> None:
     """Validate a canonical daily ETF price dataset.
 
     Missing market values are allowed because provider observations may be
-    legitimately incomplete. Market columns must already use real numeric pandas
-    dtypes; the validator never coerces strings or complex values. Column labels
-    must be unique. Present price values must be finite and positive, volume must
-    be finite and non-negative, and available OHLC fields must be internally
-    consistent. Date columns must already use the canonical datetime dtypes. The
-    function never fills or repairs observations.
+    legitimately incomplete. Market columns must already use supported dense
+    integer or floating pandas numeric dtypes; sparse, PyArrow decimal, string,
+    and complex dtypes are not coerced. Column labels must be unique. Present
+    price values must be finite and positive, volume must be finite and
+    non-negative, and available OHLC fields must be internally consistent. Date
+    columns must already use the canonical datetime dtypes. The function never
+    fills or repairs observations.
 
     Args:
         data: Candidate data in the canonical daily price schema.
@@ -140,50 +203,17 @@ def validate_price_data(data: pd.DataFrame) -> None:
             relationships violate the canonical data contract.
     """
 
-    _validate_columns(data)
-
-    if isinstance(data["date"].dtype, pd.DatetimeTZDtype) or not is_datetime64_dtype(
-        data["date"].dtype
-    ):
-        raise PriceDataValidationError(
-            "Column 'date' must have a timezone-naive datetime64 dtype."
-        )
-
-    retrieval_dtype = data["retrieved_at"].dtype
-    if not isinstance(retrieval_dtype, pd.DatetimeTZDtype):
-        raise PriceDataValidationError(
-            "Column 'retrieved_at' must have a timezone-aware datetime64 dtype."
-        )
-    if str(retrieval_dtype.tz) != "UTC":
-        raise PriceDataValidationError("Retrieval timestamps must use UTC.")
-
     numeric_columns = _numeric_columns(data)
+    _validate_canonical_keys(data)
+    _validate_retrieval_timestamps(data)
     if data.empty:
         return
-
-    invalid_ticker = data["ticker"].map(
-        lambda value: not isinstance(value, str) or not value.strip()
-    )
-    if invalid_ticker.any():
-        raise PriceDataValidationError("Ticker values must be non-empty strings.")
-
-    if data["date"].isna().any():
-        raise PriceDataValidationError("Price dates must not be missing or invalid.")
-    if data["date"].ne(data["date"].dt.normalize()).any():
-        raise PriceDataValidationError(
-            "Price dates must be normalized to midnight without intraday times."
-        )
 
     duplicate_keys = data.duplicated(list(PRICE_KEY_COLUMNS), keep=False)
     if duplicate_keys.any():
         raise PriceDataValidationError(
             "Price data contain duplicate ticker/date pairs at "
             f"{_key_examples(data, duplicate_keys)}."
-        )
-
-    if data["retrieved_at"].isna().any():
-        raise PriceDataValidationError(
-            "Retrieval timestamps must not be missing or invalid."
         )
 
     no_market_values = data[list(PRICE_VALUE_COLUMNS)].isna().all(axis=1)
@@ -215,8 +245,9 @@ def deduplicate_price_data(data: pd.DataFrame) -> pd.DataFrame:
     """Remove identical ticker/date observations and reject conflicts.
 
     Market-value equality is assessed across raw OHLC, adjusted close, and
-    volume. Retrieval time is provenance for the download rather than a market
-    value, so the first row is retained when market values agree.
+    volume. Retrieval time is provenance rather than a market value, so the row
+    with the latest retrieval timestamp is retained as the provenance watermark
+    when all market values agree.
 
     Args:
         data: Price observations containing the canonical columns.
@@ -229,7 +260,9 @@ def deduplicate_price_data(data: pd.DataFrame) -> pd.DataFrame:
             values or the canonical schema is malformed.
     """
 
-    _validate_columns(data)
+    _prevalidate_price_structure_and_dtypes(data)
+    _validate_canonical_keys(data)
+    _validate_retrieval_timestamps(data)
     duplicate_keys = data.duplicated(list(PRICE_KEY_COLUMNS), keep=False)
     if not duplicate_keys.any():
         return data.copy()
@@ -252,4 +285,11 @@ def deduplicate_price_data(data: pd.DataFrame) -> pd.DataFrame:
             f"{conflicting_keys[:5]}."
         )
 
-    return data.drop_duplicates(list(PRICE_KEY_COLUMNS), keep="first").copy()
+    input_order_column = "_price_input_order"
+    ordered = data.assign(**{input_order_column: range(len(data))}).sort_values(
+        ["retrieved_at", input_order_column], kind="mergesort"
+    )
+    deduplicated = ordered.drop_duplicates(
+        list(PRICE_KEY_COLUMNS), keep="last"
+    ).sort_values(input_order_column, kind="mergesort")
+    return deduplicated.drop(columns=input_order_column).copy()

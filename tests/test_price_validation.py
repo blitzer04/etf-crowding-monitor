@@ -6,10 +6,14 @@ import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pytest
+from pandas.api.types import is_any_real_numeric_dtype
 
 import etf_crowding.data.prices as price_module
 from etf_crowding.data.prices import persist_price_history
@@ -23,6 +27,7 @@ from etf_crowding.data.validation import (
 RETRIEVED_AT = datetime(2026, 8, 13, 12, 30, tzinfo=UTC)
 NEW_RETRIEVED_AT = pd.Timestamp("2026-08-14T12:30:00Z")
 SNAPSHOT_TIME = datetime(2026, 8, 14, 13, 0, tzinfo=UTC)
+ARROW_DECIMAL_DTYPE = pd.ArrowDtype(pa.decimal128(20, 2))
 
 
 def _canonical_prices() -> pd.DataFrame:
@@ -45,6 +50,17 @@ def _with_duplicate_column_label(prices: pd.DataFrame, column: str) -> pd.DataFr
     return pd.concat([prices, prices[[column]].copy()], axis="columns")
 
 
+def _duplicate_prices_with_malformed_ticker(value: object) -> pd.DataFrame:
+    duplicated = pd.concat(
+        [_canonical_prices().iloc[[0]], _canonical_prices().iloc[[0]]],
+        ignore_index=True,
+    )
+    ticker_values = np.empty(2, dtype=object)
+    ticker_values[:] = [value, value]
+    duplicated["ticker"] = pd.Series(ticker_values, dtype="object")
+    return duplicated
+
+
 def _appended_price_row(
     date_value: str,
     *,
@@ -53,6 +69,50 @@ def _appended_price_row(
     row = _canonical_prices().iloc[[0]].copy()
     row["date"] = pd.Timestamp(date_value)
     row["retrieved_at"] = retrieved_at
+    return row
+
+
+def _price_row_with_numeric_dtype(
+    date_value: str,
+    dtype: str,
+    *,
+    retrieved_at: pd.Timestamp | datetime = RETRIEVED_AT,
+    adjusted_close: object = 101.5,
+) -> pd.DataFrame:
+    row = _canonical_prices().iloc[[0]].copy()
+    row["date"] = pd.Timestamp(date_value)
+    values: dict[str, object] = {
+        "open": 100.0,
+        "high": 103.0,
+        "low": 99.0,
+        "close": 102.0,
+        "adjusted_close": adjusted_close,
+        "volume": 1_000_000.0,
+    }
+    for column, value in values.items():
+        row[column] = pd.Series([value], index=row.index, dtype=dtype)
+    row["retrieved_at"] = retrieved_at
+    return row
+
+
+def _large_integer_price_row(
+    date_value: str,
+    value: int,
+    dtype: str,
+    *,
+    retrieved_at: pd.Timestamp | datetime = RETRIEVED_AT,
+) -> pd.DataFrame:
+    row = _canonical_prices().iloc[[0]].copy()
+    row["date"] = pd.Timestamp(date_value)
+    for column in PRICE_VALUE_COLUMNS:
+        row[column] = pd.Series([value], index=row.index, dtype=dtype)
+    row["retrieved_at"] = retrieved_at
+    return row
+
+
+def _price_row_with_decimal(value: Decimal | None) -> pd.DataFrame:
+    row = _canonical_prices().iloc[[0]].copy()
+    row["open"] = pd.Series([value], index=row.index, dtype=ARROW_DECIMAL_DTYPE)
     return row
 
 
@@ -90,7 +150,7 @@ def test_exact_duplicate_observations_are_deduplicated() -> None:
     deduplicated = deduplicate_price_data(duplicated_data)
 
     assert len(deduplicated) == 1
-    assert deduplicated["retrieved_at"].iloc[0] == pd.Timestamp(RETRIEVED_AT)
+    assert deduplicated["retrieved_at"].iloc[0] == pd.Timestamp("2026-08-14T00:00:00Z")
 
 
 def test_conflicting_duplicate_observations_are_rejected() -> None:
@@ -101,6 +161,37 @@ def test_conflicting_duplicate_observations_are_rejected() -> None:
 
     with pytest.raises(PriceDataValidationError, match="Conflicting market values"):
         deduplicate_price_data(duplicated_data)
+
+
+def test_unhashable_object_market_values_are_rejected_before_deduplication() -> None:
+    duplicated = pd.concat(
+        [_canonical_prices().iloc[[0]], _canonical_prices().iloc[[0]]],
+        ignore_index=True,
+    )
+    values = np.empty(2, dtype=object)
+    values[:] = [[100.0], np.array([100.0])]
+    duplicated["open"] = pd.Series(values, dtype="object")
+
+    with pytest.raises(
+        PriceDataValidationError, match=r"'open'.*real numeric dtype.*object"
+    ):
+        deduplicate_price_data(duplicated)
+
+
+@pytest.mark.parametrize(
+    "malformed_ticker",
+    [["SPY"], np.array(["SPY"])],
+    ids=["list", "numpy-array"],
+)
+def test_malformed_ticker_is_rejected_before_price_duplicate_hashing(
+    malformed_ticker: object,
+) -> None:
+    invalid = _duplicate_prices_with_malformed_ticker(malformed_ticker)
+
+    with pytest.raises(
+        PriceDataValidationError, match="Ticker values must be non-empty strings"
+    ):
+        deduplicate_price_data(invalid)
 
 
 @pytest.mark.parametrize(
@@ -575,10 +666,114 @@ def test_repeated_persistence_does_not_duplicate_rows(tmp_path: Path) -> None:
 
     assert len(result.prices) == 2
     assert not result.prices.duplicated(["ticker", "date"]).any()
-    assert (result.prices["retrieved_at"] == pd.Timestamp(RETRIEVED_AT)).all()
+    assert (result.prices["retrieved_at"] == pd.Timestamp("2026-08-14T00:00:00Z")).all()
     assert result.revised_row_count == 0
     assert result.snapshot_path is None
     assert not snapshot_dir.exists()
+
+
+def test_advanced_price_watermark_blocks_older_revision_and_snapshots_later_one(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    snapshot_dir = tmp_path / "snapshots" / "prices"
+    canonical = _canonical_prices()
+    persist_price_history(canonical, output_path)
+
+    watermark_time = pd.Timestamp("2026-08-15T12:30:00Z")
+    identical = canonical.iloc[[0]].copy()
+    identical["retrieved_at"] = watermark_time
+    watermark_result = persist_price_history(
+        identical,
+        output_path,
+        snapshot_dir=snapshot_dir,
+        snapshot_time=SNAPSHOT_TIME,
+    )
+
+    watermark_row = watermark_result.prices.loc[
+        watermark_result.prices["date"].eq(pd.Timestamp("2024-01-02"))
+    ]
+    assert (
+        watermark_row[list(PRICE_VALUE_COLUMNS)].iloc[0].tolist()
+        == canonical[list(PRICE_VALUE_COLUMNS)].iloc[0].tolist()
+    )
+    assert watermark_row["retrieved_at"].iloc[0] == watermark_time
+    assert watermark_result.revised_row_count == 0
+    assert watermark_result.snapshot_path is None
+    assert not snapshot_dir.exists()
+    watermarked_file = output_path.read_bytes()
+
+    stale_revision = canonical.iloc[[0]].copy()
+    stale_revision["adjusted_close"] = 101.75
+    stale_revision["retrieved_at"] = NEW_RETRIEVED_AT
+    with pytest.raises(PriceDataValidationError, match="older than the canonical"):
+        persist_price_history(
+            stale_revision,
+            output_path,
+            snapshot_dir=snapshot_dir,
+            snapshot_time=SNAPSHOT_TIME,
+        )
+
+    assert output_path.read_bytes() == watermarked_file
+    assert not snapshot_dir.exists()
+
+    later_revision_time = pd.Timestamp("2026-08-16T12:30:00Z")
+    later_revision = canonical.iloc[[0]].copy()
+    later_revision[["open", "high", "low", "close", "adjusted_close", "volume"]] = [
+        50.0,
+        52.0,
+        49.0,
+        51.0,
+        50.5,
+        2_000_000.0,
+    ]
+    later_revision["retrieved_at"] = later_revision_time
+    revised_result = persist_price_history(
+        later_revision,
+        output_path,
+        snapshot_dir=snapshot_dir,
+        snapshot_time=SNAPSHOT_TIME,
+    )
+
+    assert revised_result.revised_row_count == 1
+    assert revised_result.snapshot_path is not None
+    assert revised_result.snapshot_path.read_bytes() == watermarked_file
+    snapshotted = pd.read_parquet(revised_result.snapshot_path)
+    snapshotted_row = snapshotted.loc[
+        snapshotted["date"].eq(pd.Timestamp("2024-01-02"))
+    ]
+    assert snapshotted_row["retrieved_at"].iloc[0] == watermark_time
+    revised_row = revised_result.prices.loc[
+        revised_result.prices["date"].eq(pd.Timestamp("2024-01-02"))
+    ]
+    assert (
+        revised_row[list(PRICE_VALUE_COLUMNS)].iloc[0].tolist()
+        == later_revision[list(PRICE_VALUE_COLUMNS)].iloc[0].tolist()
+    )
+    assert revised_row["retrieved_at"].iloc[0] == later_revision_time
+
+
+def test_older_and_equal_identical_prices_do_not_move_watermark_backward(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    canonical = _canonical_prices()
+    watermark_time = pd.Timestamp("2026-08-15T12:30:00Z")
+    canonical["retrieved_at"] = watermark_time
+    persist_price_history(canonical, output_path)
+
+    older = _canonical_prices().iloc[[0]].copy()
+    older_result = persist_price_history(older, output_path)
+    equal = canonical.iloc[[0]].copy()
+    equal_result = persist_price_history(equal, output_path)
+
+    for result in (older_result, equal_result):
+        retained = result.prices.loc[
+            result.prices["date"].eq(pd.Timestamp("2024-01-02"))
+        ]
+        assert retained["retrieved_at"].iloc[0] == watermark_time
+        assert result.revised_row_count == 0
+        assert result.snapshot_path is None
 
 
 def test_equal_retrieved_at_and_identical_values_remain_a_no_op(
@@ -832,7 +1027,36 @@ def test_nullable_float_both_missing_remains_identical(tmp_path: Path) -> None:
         result.prices["date"].eq(pd.Timestamp("2024-01-02"))
     ]
     assert pd.isna(retained_row["adjusted_close"].iloc[0])
-    assert retained_row["retrieved_at"].iloc[0] == pd.Timestamp(RETRIEVED_AT)
+    assert retained_row["retrieved_at"].iloc[0] == NEW_RETRIEVED_AT
+
+
+def test_advanced_missing_price_watermark_rejects_older_completion(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    snapshot_dir = tmp_path / "snapshots" / "prices"
+    existing = _canonical_prices()
+    existing["adjusted_close"] = pd.Series([pd.NA, 103.5], dtype="Float64")
+    persist_price_history(existing, output_path)
+
+    watermark_time = pd.Timestamp("2026-08-15T12:30:00Z")
+    identical_missing = existing.iloc[[0]].copy()
+    identical_missing["retrieved_at"] = watermark_time
+    persist_price_history(identical_missing, output_path)
+    watermarked_file = output_path.read_bytes()
+
+    older_completion = _canonical_prices().iloc[[0]].copy()
+    older_completion["retrieved_at"] = NEW_RETRIEVED_AT
+    with pytest.raises(PriceDataValidationError, match="older than the canonical"):
+        persist_price_history(
+            older_completion,
+            output_path,
+            snapshot_dir=snapshot_dir,
+            snapshot_time=SNAPSHOT_TIME,
+        )
+
+    assert output_path.read_bytes() == watermarked_file
+    assert not snapshot_dir.exists()
 
 
 def test_nullable_numeric_present_to_missing_triggers_value_loss_rejection(
@@ -981,6 +1205,58 @@ def test_numeric_string_market_column_is_rejected_before_persistence(
     assert not output_path.exists()
 
 
+def test_persistence_rejects_unhashable_duplicate_market_data_without_type_error(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    persist_price_history(_canonical_prices(), output_path)
+    canonical_bytes = output_path.read_bytes()
+    invalid = pd.concat(
+        [_canonical_prices().iloc[[0]], _canonical_prices().iloc[[0]]],
+        ignore_index=True,
+    )
+    invalid["close"] = pd.Series([[102.0], [102.0]], dtype="object")
+
+    with pytest.raises(
+        PriceDataValidationError, match=r"'close'.*real numeric dtype.*object"
+    ):
+        persist_price_history(invalid, output_path)
+
+    assert output_path.read_bytes() == canonical_bytes
+
+
+def test_malformed_incoming_price_ticker_does_not_modify_canonical(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    persist_price_history(_canonical_prices(), output_path)
+    canonical_bytes = output_path.read_bytes()
+    invalid = _duplicate_prices_with_malformed_ticker(["SPY"])
+
+    with pytest.raises(
+        PriceDataValidationError, match="Ticker values must be non-empty strings"
+    ):
+        persist_price_history(invalid, output_path)
+
+    assert output_path.read_bytes() == canonical_bytes
+
+
+def test_malformed_existing_price_ticker_parquet_fails_without_type_error(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    malformed = _duplicate_prices_with_malformed_ticker(["SPY"])
+    malformed.to_parquet(output_path, index=False)
+    malformed_bytes = output_path.read_bytes()
+
+    with pytest.raises(
+        PriceDataValidationError, match="Ticker values must be non-empty strings"
+    ):
+        persist_price_history(_appended_price_row("2024-01-04"), output_path)
+
+    assert output_path.read_bytes() == malformed_bytes
+
+
 def test_boolean_market_column_is_rejected() -> None:
     invalid = _canonical_prices()
     invalid["volume"] = pd.Series([True, False], dtype="boolean")
@@ -1099,6 +1375,158 @@ def test_string_retrieved_at_column_is_rejected_before_persistence(
     assert not output_path.exists()
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        "int64",
+        "uint64",
+        "float64",
+        "Int64",
+        "UInt64",
+        "Float64",
+        "int64[pyarrow]",
+        "uint64[pyarrow]",
+        "double[pyarrow]",
+    ],
+)
+def test_supported_canonical_price_numeric_dtypes_are_accepted(dtype: str) -> None:
+    prices = _canonical_prices()
+    values_by_column = {
+        "open": [100, 102],
+        "high": [103, 105],
+        "low": [99, 101],
+        "close": [102, 104],
+        "adjusted_close": [101, 103],
+        "volume": [1_000_000, 1_200_000],
+    }
+    for column, values in values_by_column.items():
+        prices[column] = pd.Series(values, dtype=dtype)
+
+    validate_price_data(prices)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [Decimal("100.00"), None],
+    ids=["finite-positive", "missing"],
+)
+def test_arrow_decimal_price_field_is_rejected_cleanly(
+    value: Decimal | None,
+) -> None:
+    invalid = _price_row_with_decimal(value)
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match=r"'open'.*unsupported real numeric dtype.*decimal128\(20, 2\)",
+    ):
+        validate_price_data(invalid)
+
+
+def test_arrow_decimal_price_is_rejected_before_deduplication() -> None:
+    decimal_row = _price_row_with_decimal(Decimal("100.00"))
+    duplicated = pd.concat([decimal_row, decimal_row], ignore_index=True)
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match=r"'open'.*unsupported real numeric dtype.*decimal128\(20, 2\)",
+    ):
+        deduplicate_price_data(duplicated)
+
+
+def test_decimal_price_persistence_leaves_canonical_unchanged(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    persist_price_history(_canonical_prices(), output_path)
+    canonical_bytes = output_path.read_bytes()
+    invalid = _price_row_with_decimal(Decimal("100.00"))
+    invalid["date"] = pd.Timestamp("2024-01-04")
+    invalid["retrieved_at"] = NEW_RETRIEVED_AT
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match=r"'open'.*unsupported real numeric dtype.*decimal128\(20, 2\)",
+    ):
+        persist_price_history(invalid, output_path)
+
+    assert output_path.read_bytes() == canonical_bytes
+
+
+def test_existing_decimal_price_parquet_fails_cleanly_without_mutation(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    decimal_canonical = _price_row_with_decimal(Decimal("100.00"))
+    decimal_canonical.to_parquet(output_path, index=False)
+    canonical_bytes = output_path.read_bytes()
+    assert pd.read_parquet(output_path)["open"].dtype == object
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match=r"'open'.*real numeric dtype.*received object",
+    ):
+        persist_price_history(_appended_price_row("2024-01-04"), output_path)
+
+    assert output_path.read_bytes() == canonical_bytes
+
+
+@pytest.mark.parametrize(
+    ("values", "sparse_dtype"),
+    [
+        ([100, 102], pd.SparseDtype("int64", 0)),
+        ([100.0, 102.0], pd.SparseDtype("float64", 0.0)),
+        ([100.0, pd.NA], pd.SparseDtype("float64", float("nan"))),
+    ],
+    ids=["sparse-int64", "sparse-float64", "sparse-missing"],
+)
+def test_sparse_price_dtypes_are_rejected_cleanly(
+    values: list[object],
+    sparse_dtype: pd.SparseDtype,
+) -> None:
+    invalid = _canonical_prices()
+    invalid["open"] = pd.Series(values, dtype=sparse_dtype)
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match=r"'open'.*unsupported real numeric dtype.*Sparse",
+    ):
+        validate_price_data(invalid)
+
+
+def test_sparse_prices_are_rejected_before_duplicate_processing() -> None:
+    duplicated = pd.concat(
+        [_canonical_prices().iloc[[0]], _canonical_prices().iloc[[0]]],
+        ignore_index=True,
+    )
+    duplicated["open"] = pd.Series([100, 100], dtype=pd.SparseDtype("int64", 0))
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match=r"'open'.*unsupported real numeric dtype.*Sparse",
+    ):
+        deduplicate_price_data(duplicated)
+
+
+def test_sparse_price_persistence_leaves_canonical_unchanged(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    persist_price_history(_canonical_prices(), output_path)
+    canonical_bytes = output_path.read_bytes()
+    invalid = _appended_price_row("2024-01-04")
+    invalid["open"] = pd.Series(
+        [100], index=invalid.index, dtype=pd.SparseDtype("int64", 0)
+    )
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match=r"'open'.*unsupported real numeric dtype.*Sparse",
+    ):
+        persist_price_history(invalid, output_path)
+
+    assert output_path.read_bytes() == canonical_bytes
+
+
 def test_supported_numeric_dtypes_survive_parquet_round_trip(tmp_path: Path) -> None:
     output_path = tmp_path / "etf_prices_daily.parquet"
     prices = _canonical_prices()
@@ -1124,3 +1552,110 @@ def test_supported_numeric_dtypes_survive_parquet_round_trip(tmp_path: Path) -> 
     assert str(reloaded["volume"].dtype) == "Int64"
     pd.testing.assert_frame_equal(reloaded, result.prices)
     validate_price_data(reloaded)
+
+
+@pytest.mark.parametrize(
+    ("existing_dtype", "incoming_dtype"),
+    [
+        ("double[pyarrow]", "Float64"),
+        ("Float64", "double[pyarrow]"),
+        ("float64", "Float64"),
+    ],
+)
+def test_mixed_floating_price_backends_append_without_object_fallback(
+    tmp_path: Path,
+    existing_dtype: str,
+    incoming_dtype: str,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    existing = _price_row_with_numeric_dtype("2024-01-02", existing_dtype)
+    incoming = _price_row_with_numeric_dtype(
+        "2024-01-03", incoming_dtype, retrieved_at=NEW_RETRIEVED_AT
+    )
+
+    persist_price_history(existing, output_path)
+    result = persist_price_history(incoming, output_path)
+    reloaded = pd.read_parquet(output_path)
+
+    for column in PRICE_VALUE_COLUMNS:
+        assert is_any_real_numeric_dtype(result.prices[column].dtype)
+        assert result.prices[column].dtype != object
+    assert result.prices["close"].tolist() == [102.0, 102.0]
+    validate_price_data(reloaded)
+
+
+def test_mixed_integer_price_backends_preserve_large_values_exactly(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    large_integer = 9_007_199_254_740_993
+    existing = _large_integer_price_row("2024-01-02", large_integer, "int64[pyarrow]")
+    incoming = _large_integer_price_row(
+        "2024-01-03",
+        large_integer + 2,
+        "Int64",
+        retrieved_at=NEW_RETRIEVED_AT,
+    )
+
+    persist_price_history(existing, output_path)
+    result = persist_price_history(incoming, output_path)
+
+    for column in PRICE_VALUE_COLUMNS:
+        assert is_any_real_numeric_dtype(result.prices[column].dtype)
+        assert result.prices[column].tolist() == [large_integer, large_integer + 2]
+
+
+def test_mixed_price_representation_preserves_missing_watermark_and_revisions(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    snapshot_dir = tmp_path / "snapshots" / "prices"
+    watermark_time = pd.Timestamp("2026-08-15T12:30:00Z")
+    revision_time = pd.Timestamp("2026-08-16T12:30:00Z")
+    existing = _price_row_with_numeric_dtype(
+        "2024-01-02", "double[pyarrow]", adjusted_close=pd.NA
+    )
+    persist_price_history(existing, output_path)
+
+    identical = _price_row_with_numeric_dtype(
+        "2024-01-02",
+        "Float64",
+        adjusted_close=pd.NA,
+        retrieved_at=watermark_time,
+    )
+    watermark_result = persist_price_history(
+        identical,
+        output_path,
+        snapshot_dir=snapshot_dir,
+        snapshot_time=SNAPSHOT_TIME,
+    )
+
+    assert watermark_result.revised_row_count == 0
+    assert watermark_result.snapshot_path is None
+    assert not snapshot_dir.exists()
+    assert pd.isna(watermark_result.prices["adjusted_close"].iloc[0])
+    assert watermark_result.prices["retrieved_at"].iloc[0] == watermark_time
+    watermarked_file = output_path.read_bytes()
+
+    revision = _price_row_with_numeric_dtype(
+        "2024-01-02",
+        "double[pyarrow]",
+        adjusted_close=pd.NA,
+        retrieved_at=revision_time,
+    )
+    revision["close"] = pd.Series(
+        [102.5], index=revision.index, dtype="double[pyarrow]"
+    )
+    revised_result = persist_price_history(
+        revision,
+        output_path,
+        snapshot_dir=snapshot_dir,
+        snapshot_time=SNAPSHOT_TIME,
+    )
+
+    assert revised_result.revised_row_count == 1
+    assert revised_result.snapshot_path is not None
+    assert revised_result.snapshot_path.read_bytes() == watermarked_file
+    assert revised_result.prices["close"].iloc[0] == 102.5
+    assert pd.isna(revised_result.prices["adjusted_close"].iloc[0])
+    assert revised_result.prices["retrieved_at"].iloc[0] == revision_time

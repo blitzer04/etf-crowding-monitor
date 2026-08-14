@@ -175,10 +175,13 @@ updates before changing that exact pin.
 | `retrieved_at` | UTC client-side timestamp captured after that ticker response returns |
 
 Canonical column labels must be unique. Every canonical market column (`open`,
-`high`, `low`, `close`, `adjusted_close`, and `volume`) must already have a real
-numeric pandas dtype. Boolean, complex, string, object, datetime, timedelta,
-categorical, and other non-real-numeric dtypes are rejected before persistence;
-they are never converted into plausible market values.
+`high`, `low`, `close`, `adjusted_close`, and `volume`) must already use a
+supported dense real numeric integer or floating pandas dtype, including
+supported NumPy, nullable pandas, and PyArrow-backed representations. Pandas
+SparseDtype and PyArrow decimal are currently unsupported. Boolean, complex,
+string, object, datetime, timedelta, categorical, sparse, decimal, and other
+unsupported dtypes are rejected before persistence; they are never converted
+into plausible market values.
 
 The adapter reads Yahoo chart quote arrays before yfinance's high-level history
 transformations, so no `Adj Close / Close` automatic OHLC adjustment or back
@@ -208,23 +211,29 @@ valid observations. If every ticker is empty or failed, the command exits with
 an error and does not replace existing history.
 
 The canonical Parquet file represents the latest successfully validated
-Yahoo/yfinance source vintage available to the pipeline. Repeated updates retain
-identical overlapping rows once and do not treat retrieval-time differences as
-revisions. A newer whole-row source vintage may complete previously missing
-fields or revise existing market values. The pipeline does not infer whether a
-revision arose from a dividend, split, other corporate action, Yahoo correction,
-or another provider change.
+Yahoo/yfinance source vintage available to the pipeline. For each persisted
+ticker/date row, `retrieved_at` is the latest client-side retrieval time at
+which the project observed the currently stored six market fields. It is not a
+Yahoo publication or revision timestamp. A later identical observation keeps
+all market values unchanged while advancing only this provenance watermark; it
+is not a source-value revision. A newer whole-row source vintage may complete
+previously missing fields or revise existing market values. The pipeline does
+not infer whether a revision arose from a dividend, split, other corporate
+action, Yahoo correction, or another provider change.
 
 For a changed overlapping ticker/date row, the incoming `retrieved_at` must be
-later than the canonical row's timestamp. An older incoming vintage is rejected;
-different values with the same timestamp are also rejected as inconsistent.
-Identical market fields remain a no-op regardless of timestamp and retain the
-existing canonical row and provenance.
+later than the canonical row's provenance watermark. An older incoming vintage
+is rejected; different values with the same timestamp are also rejected as
+inconsistent. An older or equal identical observation leaves the watermark
+unchanged, so it can never move backward.
 
 Before revised overlapping rows replace the canonical values, the exact
 superseded canonical Parquet is preserved under `data/snapshots/prices/` with a
 collision-safe UTC timestamp. The revision is reported by row count and affected
 ticker. If snapshot preservation fails, the canonical file remains unchanged.
+Advancing only `retrieved_at` for identical source values atomically rewrites the
+canonical file but creates no revision snapshot because no financial value was
+superseded.
 An incoming overlap that loses a previously available market value is rejected
 for manual review rather than erasing data or mixing fields from different
 source vintages. Non-requested, empty, or failed tickers retain their existing
@@ -239,35 +248,118 @@ Market-data coverage, field availability, adjustment calculations, revisions,
 rate limits, and service continuity depend on yfinance and Yahoo Finance. This
 third-party dataset should not be treated as an exchange-authoritative record.
 
+## Shares-outstanding data pipeline
+
+Day 3 adds an offline-tested historical ETF shares-outstanding ingestion layer.
+It records source observations only; it does not calculate fund flows or a
+creation/redemption flow proxy. Run the updater from the repository root:
+
+```text
+.venv\Scripts\python.exe scripts\update_shares.py
+```
+
+The canonical output is
+`data/processed/etf_shares_outstanding.parquet`. Optional `--start`, `--end`,
+and `--output` arguments control provider query bounds and the destination. In
+the inspected yfinance 1.5.2 implementation, an omitted start resolves to 548
+days before its exchange-local end time. For reproducible multi-ticker batches,
+the project captures one client-side reference instant when `--end` is omitted,
+then converts that same instant independently to each ticker's exchange
+timezone before constructing its bounds. A run crossing exchange-local midnight
+therefore does not use a different wall-clock instant for later tickers. The
+implementation sends `period1` and `period2` to the provider but does not
+document their exact response inclusivity. Day 3 therefore does not label these
+bounds as inclusive/exclusive and does not silently trim returned source
+observations.
+
+The inspected public interface is `Ticker.get_shares_full(start=None,
+end=None)`. Its yfinance 1.5.2 source requests the Yahoo
+fundamentals-timeseries `shares_out` field and constructs a pandas `Series`
+indexed by exchange-local, timezone-aware timestamps. The detailed schema is
+not documented by a method docstring and remains version-specific. To prevent a
+cached old response from receiving a new retrieval timestamp, the project uses
+the same pinned path through yfinance-owned uncached `Ticker._data.get`. This
+retains yfinance session, cookie/crumb, configured retry, HTTP-error, and
+rate-limit handling without adding a project HTTP client. The non-expiring
+`cache_get` response cache is deliberately bypassed.
+
+### Canonical shares-outstanding schema
+
+| Column | Definition |
+| --- | --- |
+| `date` | Source observation date, normalized to timezone-naive midnight without converting the exchange-local date |
+| `ticker` | Requested ETF ticker |
+| `shares_outstanding` | Provider `shares_out` observation in shares |
+| `retrieved_at` | UTC client-side timestamp captured after that ticker response returns |
+
+The pipeline preserves only the dates returned by the source. It does not
+assume the observations are daily, expand them onto the price or trading
+calendar, infer weekend or holiday records, interpolate, forward-fill, or
+backfill. Dated null `shares_out` values are retained because the inspected
+yfinance method constructs its Series from timestamp/value pairs without
+dropping nulls. A response with no dated history is reported as empty instead.
+
+Provider shares values must already use real numeric pandas dtypes. Canonical
+shares values must use a supported dense integer or floating dtype, including
+supported NumPy, nullable pandas, and PyArrow-backed representations. Pandas
+SparseDtype and PyArrow decimal are currently unsupported. Boolean, complex,
+string, object, datetime, timedelta, and categorical dtypes are also rejected
+rather than converted into plausible observations. Zero, negative, and infinite
+present values are invalid. Missing values within a valid nullable integer or
+floating Series remain missing. Canonical column labels must be unique, and
+duplicate ticker/date values must be identical to deduplicate; conflicting
+duplicates are invalid.
+
+The canonical Parquet represents the latest successfully validated source
+vintage observed by this project. For each persisted ticker/date row,
+`retrieved_at` is the latest client-side retrieval time at which the project
+observed the currently stored shares value; it is not a Yahoo publication or
+revision timestamp. A later identical observation advances only that watermark,
+without changing shares or creating a revision snapshot. Older or equal
+identical observations cannot move it backward. A newer changed value or
+missing-to-present completion replaces the whole row only after an exact
+snapshot of the superseded canonical file is published under
+`data/snapshots/shares/`. Stale revisions, different values with the same
+`retrieved_at`, and present-to-missing value loss are rejected. An adjacent
+per-output lock serializes the complete read, validation, merge, snapshot, and
+atomic replacement transaction with a 30-second timeout. Partial batches retain
+history for failed, empty, and unrequested tickers; an entirely empty or failed
+batch cannot replace canonical history.
+
+No live Yahoo request was used to establish Day 3. Actual ETF availability,
+history depth, source observation frequency, revisions, and null patterns are
+therefore unverified and may be incomplete. The adapter and its offline
+contract tests are pinned to yfinance 1.5.2 and require renewed inspection on a
+provider upgrade.
+
 ## Technology stack
 
 - Python 3.12
 - pandas, NumPy, SciPy, and statsmodels for data and statistical work
-- yfinance 1.5.2 as the pinned third-party historical price-data interface
+- yfinance 1.5.2 as the pinned historical price and shares-data interface
 - PyYAML and PyArrow for configuration and data storage
 - Plotly and Streamlit for the planned public application
 - pytest, Ruff, and mypy for quality checks
 
 ## Current development status
 
-Day 1 established the repository layout, packaging and tool configuration,
-canonical ETF-universe configuration, configuration validation, methodology
-documentation, and offline unit tests. Day 2 implements the historical daily
-price download, normalization, validation, incremental Parquet persistence, and
-command-line update workflow. Shares-outstanding history, flow proxies,
-holdings, concentration, momentum, volatility, crowding scores, backtests,
-analysis case studies, and Streamlit pages are not yet implemented.
+Day 1 established the repository foundation and canonical ETF universe. Day 2
+implements historical daily price ingestion. Day 3 implements the historical
+shares-outstanding ingestion, validation, incremental Parquet persistence, and
+command-line update workflow. Creation/redemption flow proxies, holdings,
+concentration, momentum, volatility, crowding scores, backtests, analysis case
+studies, and Streamlit pages are not yet implemented.
 
 ## Data limitations
 
 Limitations include survivorship bias from the present-day curated universe,
-third-party price-data availability and revisions, missing price observations,
-anticipated incomplete shares-outstanding history, the difference between a
-future flow proxy and reported flows, and lack of historical point-in-time
-holdings. Missing data are not silently invented or forward-filled. Each price
-row records the client-side retrieval time of its ticker response, but Yahoo
-Finance does not provide an exchange-authoritative publication timestamp for
-every historical observation.
+third-party price and shares-data availability and revisions, missing
+observations, unverified and potentially incomplete shares-outstanding coverage,
+the difference between a future flow proxy and reported flows, and lack of
+historical point-in-time holdings. Missing data are not silently invented or
+forward-filled. Each canonical row records a client-side retrieval time, but
+Yahoo Finance does not provide an exchange-authoritative publication timestamp
+for every historical observation.
 
 ## Installation
 

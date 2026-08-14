@@ -322,6 +322,34 @@ def test_nullable_float64_and_int64_provider_columns_remain_valid() -> None:
     )
 
 
+def test_price_download_batch_uses_one_stable_dense_numeric_representation() -> None:
+    dtypes = {"SPY": "int64[pyarrow]", "QQQ": "Float64"}
+
+    def mixed_backend_download(ticker: str, start: date, end: date) -> pd.DataFrame:
+        del start, end
+        provider_data = _single_ticker_frame().round()
+        for field in PROVIDER_FIELDS:
+            provider_data[field] = pd.Series(
+                provider_data[field].tolist(),
+                index=provider_data.index,
+                dtype=dtypes[ticker],
+            )
+        return provider_data
+
+    result = download_price_history(
+        ["SPY", "QQQ"],
+        start="2024-01-01",
+        end="2024-02-01",
+        downloader=mixed_backend_download,
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert set(result.successful_tickers) == {"SPY", "QQQ"}
+    assert all(
+        str(result.prices[column].dtype) == "float64" for column in PRICE_VALUE_COLUMNS
+    )
+
+
 def test_single_ticker_multiindex_output_is_supported() -> None:
     provider_data = _single_ticker_frame()
     provider_data.columns = pd.MultiIndex.from_product(

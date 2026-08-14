@@ -23,6 +23,10 @@ from pandas.api.types import is_any_real_numeric_dtype
 from yfinance import utils as yf_utils  # type: ignore[import-untyped]
 from yfinance.const import _BASE_URL_  # type: ignore[import-untyped]
 
+from etf_crowding.data.numeric_dtypes import (
+    NumericDtypeHarmonizationError,
+    harmonize_real_numeric_series,
+)
 from etf_crowding.data.validation import (
     CANONICAL_PRICE_COLUMNS,
     PRICE_VALUE_COLUMNS,
@@ -30,6 +34,7 @@ from etf_crowding.data.validation import (
     deduplicate_price_data,
     validate_price_data,
 )
+from etf_crowding.data.yfinance_runtime import yfinance_exception_visibility
 from etf_crowding.paths import get_snapshot_data_dir
 
 DEFAULT_PRICE_START_DATE = date(2018, 1, 1)
@@ -694,16 +699,12 @@ def normalize_yfinance_output(
 def _download_yfinance_ticker(
     ticker: str, start_date: date, end_date: date
 ) -> pd.DataFrame | None:
-    previous_hide_exceptions = yf.config.debug.hide_exceptions
-    try:
+    with yfinance_exception_visibility():
         # yfinance 1.5.2 uses this public config setting to surface provider
         # exceptions. Raw arrays are requested before its history processing can
         # synthesize adjusted close, zero-fill volume, or discard empty rows.
-        yf.config.debug.hide_exceptions = False
         payload = _request_raw_yfinance_chart(ticker, start_date, end_date)
-        return _raw_chart_to_provider_frame(payload, ticker)
-    finally:
-        yf.config.debug.hide_exceptions = previous_hide_exceptions
+    return _raw_chart_to_provider_frame(payload, ticker)
 
 
 def download_price_history(
@@ -1024,12 +1025,25 @@ def _merge_price_vintages(
         identical_fields &= field_is_identical.astype(bool)
 
     revised_keys = overlap_keys[~identical_fields]
+    existing_overlap_times = existing_by_key.loc[overlap_keys, "retrieved_at"]
+    incoming_overlap_times = incoming_by_key.loc[overlap_keys, "retrieved_at"]
+    newer_identical_keys = overlap_keys[
+        identical_fields & incoming_overlap_times.gt(existing_overlap_times)
+    ]
     if revised_keys.empty:
+        retained_existing = existing_by_key.copy()
+        if not newer_identical_keys.empty:
+            retained_existing.loc[newer_identical_keys, "retrieved_at"] = (
+                incoming_by_key.loc[newer_identical_keys, "retrieved_at"].array
+            )
         new_rows = incoming_by_key.loc[
             ~incoming_by_key.index.isin(existing_by_key.index)
         ]
         combined = pd.concat(
-            [existing, new_rows.loc[:, list(CANONICAL_PRICE_COLUMNS)]],
+            [
+                retained_existing.loc[:, list(CANONICAL_PRICE_COLUMNS)],
+                new_rows.loc[:, list(CANONICAL_PRICE_COLUMNS)],
+            ],
             ignore_index=True,
         )
         return combined, 0, ()
@@ -1054,7 +1068,13 @@ def _merge_price_vintages(
 
     revised_rows = incoming_by_key.loc[revised_keys, list(CANONICAL_PRICE_COLUMNS)]
     new_rows = incoming_by_key.loc[~incoming_by_key.index.isin(existing_by_key.index)]
-    retained_existing = existing_by_key.loc[~existing_by_key.index.isin(revised_keys)]
+    retained_existing = existing_by_key.loc[
+        ~existing_by_key.index.isin(revised_keys)
+    ].copy()
+    if not newer_identical_keys.empty:
+        retained_existing.loc[newer_identical_keys, "retrieved_at"] = (
+            incoming_by_key.loc[newer_identical_keys, "retrieved_at"].array
+        )
     combined = pd.concat(
         [
             retained_existing.loc[:, list(CANONICAL_PRICE_COLUMNS)],
@@ -1067,6 +1087,27 @@ def _merge_price_vintages(
     return combined, len(revised_rows), revised_tickers
 
 
+def _harmonize_price_numeric_dtypes(
+    existing: pd.DataFrame,
+    incoming: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    harmonized_existing = existing.copy()
+    harmonized_incoming = incoming.copy()
+    for column in PRICE_VALUE_COLUMNS:
+        try:
+            existing_values, incoming_values = harmonize_real_numeric_series(
+                existing[column], incoming[column]
+            )
+        except NumericDtypeHarmonizationError as error:
+            raise PriceDataValidationError(
+                f"Cannot losslessly combine canonical '{column}' dtypes "
+                f"{existing[column].dtype} and {incoming[column].dtype}: {error}."
+            ) from error
+        harmonized_existing[column] = existing_values
+        harmonized_incoming[column] = incoming_values
+    return harmonized_existing, harmonized_incoming
+
+
 def persist_price_history(
     incoming_data: pd.DataFrame,
     output_path: Path,
@@ -1076,13 +1117,15 @@ def persist_price_history(
 ) -> PricePersistenceResult:
     """Merge the latest validated source vintage in a serialized transaction.
 
-    Identical overlapping observations retain the existing row. A changed
-    overlap replaces the entire row with the incoming source vintage only after
-    the exact superseded canonical Parquet file is safely snapshotted. Incoming
-    rows that lose previously available market fields are rejected so fields
-    from different source vintages are never silently combined. An adjacent
-    cross-process lock serializes the complete read, validation, merge,
-    snapshot, and atomic canonical replacement for this output path.
+    Identical overlapping observations retain the existing market values while
+    advancing their provenance watermark to a later incoming retrieval time. A
+    changed overlap replaces the entire row with the incoming source vintage
+    only after the exact superseded canonical Parquet file is safely
+    snapshotted. Incoming rows that lose previously available market fields are
+    rejected so fields from different source vintages are never silently
+    combined. An adjacent cross-process lock serializes the complete read,
+    validation, merge, snapshot, and atomic canonical replacement for this
+    output path.
 
     Args:
         incoming_data: Newly downloaded canonical observations.
@@ -1121,6 +1164,7 @@ def persist_price_history(
         revised_tickers: tuple[str, ...] = ()
         snapshot_path: Path | None = None
         if existing is not None:
+            existing, incoming = _harmonize_price_numeric_dtypes(existing, incoming)
             combined, revised_row_count, revised_tickers = _merge_price_vintages(
                 existing, incoming
             )
