@@ -87,3 +87,31 @@ Before completing any task:
 6. Report the exact checks executed and their results.
 7. State unresolved limitations honestly, including unavailable data or tooling.
 8. Do not create a Git commit unless the user explicitly requests one.
+
+## Mandatory Data-Pipeline Boundary Review
+
+Before declaring an ingestion or persistence change complete, map and audit every transformation boundary:
+
+`provider payload -> identity/metadata validation -> raw extraction -> per-entity normalization -> per-entity validation -> batch combination -> batch validation -> existing-data load -> representation harmonization -> deduplication -> source-vintage merge -> coverage checks -> snapshot -> atomic persistence -> reload validation`
+
+A value/dtype/schema accepted as canonical must be supported end-to-end across every operation the pipeline requires, including comparison, hashing, concatenation, missingness, finite-value checks, Parquet write, and Parquet reload.
+
+Never assume pandas dtype promotion is lossless. Any numeric conversion that can change a financial value must be proven lossless by exact round-trip/value checks or rejected. Always test integer values above `2**53`.
+
+Validate provider-returned identifiers before assigning requested identifiers. Do not silently relabel mismatched provider data.
+
+Validate schemas, keys, and value dtypes before any hashing, grouping, duplicate detection, arithmetic, or serialization that assumes valid scalar inputs.
+
+Resolve wall-clock-dependent batch defaults once per batch when reproducibility requires a common reference instant. Convert that common instant per relevant exchange/provider timezone rather than recomputing `now` per entity.
+
+Treat process-global third-party configuration as shared mutable state. Avoid mutation where possible; otherwise use one shared synchronization mechanism across all project adapters and restore exact prior state.
+
+Source provenance must remain monotonic under concurrent retrieval/persistence orderings. Test reversed persistence order, identical later observations, stale revisions, same-vintage conflicts, and value loss.
+
+Persistence logic must distinguish positive observations from coverage metadata. If a successful refresh omits a previously stored observation inside confirmed coverage, do not silently preserve or delete it unless the methodology explicitly defines that behavior.
+
+When a defect is found in one pipeline or boundary, audit the same failure class across all analogous pipelines and all earlier/later boundaries before declaring the fix complete.
+
+Before completion, run an adversarial test matrix covering at minimum: null, zero, large integers above `2**53`, signed/unsigned integers, floating values, pandas nullable dtypes, PyArrow integer/float dtypes, unsupported numeric extensions, malformed object/list/array keys and values, reversed input ordering, mixed representations, provider-identity mismatch, date-boundary crossing, concurrency ordering, serialization round-trip, and partial/truncated provider responses where relevant.
+
+Passing the existing test suite is necessary but not sufficient. Before a major ingestion milestone is committed, perform one independent read-only audit of the full data contract. Do not call the review "final" until that audit reports no actionable P1/P2 defects.
