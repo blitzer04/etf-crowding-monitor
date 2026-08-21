@@ -25,6 +25,8 @@ from yfinance.const import _BASE_URL_  # type: ignore[import-untyped]
 
 from etf_crowding.data.numeric_dtypes import (
     NumericDtypeHarmonizationError,
+    build_lossless_real_numeric_series,
+    cast_real_numeric_series_losslessly,
     harmonize_real_numeric_series,
 )
 from etf_crowding.data.validation import (
@@ -82,6 +84,10 @@ class TickerDownloadStatus:
         last_date: Latest returned trading date, when available.
         retrieved_at: UTC time when a successful or empty ticker response
             returned. Failed outcomes have no successful retrieval timestamp.
+        query_start: Inclusive provider request date.
+        query_end: Exclusive provider request date.
+        returned_dates: Exact canonical dates returned by this ticker response.
+            Empty and failed outcomes have no returned dates.
         error: Provider or normalization error for failed requests.
     """
 
@@ -91,6 +97,9 @@ class TickerDownloadStatus:
     first_date: date | None
     last_date: date | None
     retrieved_at: datetime | None
+    query_start: date
+    query_end: date
+    returned_dates: tuple[date, ...]
     error: str | None = None
 
 
@@ -325,11 +334,13 @@ def _normalize_single_ticker(
             normalized[field] = float("nan")
             continue
         try:
-            normalized[field] = source[field].astype("float64")
-        except (OverflowError, TypeError, ValueError) as error:
+            normalized[field] = cast_real_numeric_series_losslessly(
+                source[field], "float64"
+            )
+        except NumericDtypeHarmonizationError as error:
             raise PriceNormalizationError(
-                f"yfinance field {field!r} for {ticker} cannot be represented as "
-                "canonical float64 values."
+                f"yfinance field {field!r} for {ticker} cannot be represented "
+                "losslessly as canonical float64 values."
             ) from error
 
     normalized = normalized.loc[:, list(CANONICAL_PRICE_COLUMNS)]
@@ -351,7 +362,7 @@ def _empty_raw_chart_frame() -> pd.DataFrame:
     )
 
 
-def _chart_result(payload: object, ticker: str) -> dict[str, object] | None:
+def _chart_result(payload: object, ticker: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise PriceNormalizationError(
             f"Yahoo chart response for {ticker} must be a JSON object."
@@ -381,7 +392,10 @@ def _chart_result(payload: object, ticker: str) -> dict[str, object] | None:
             f"Yahoo chart response for {ticker} is missing the 'result' list."
         )
     if not results:
-        return None
+        raise PriceNormalizationError(
+            f"Yahoo chart response for {ticker} has no result object from which "
+            "provider identity can be established."
+        )
     if len(results) != 1 or not isinstance(results[0], dict):
         raise PriceNormalizationError(
             f"Yahoo chart response for {ticker} must contain one result object."
@@ -420,13 +434,26 @@ def _raw_chart_to_provider_frame(payload: object, ticker: str) -> pd.DataFrame:
     """Preserve source-level Yahoo quote missingness in a yfinance-like frame."""
 
     result = _chart_result(payload, ticker)
-    if result is None:
-        return _empty_raw_chart_frame()
 
     meta = result.get("meta")
     if not isinstance(meta, dict):
         raise PriceNormalizationError(
             f"Yahoo chart result for {ticker} is missing the 'meta' object."
+        )
+    provider_symbol = meta.get("symbol")
+    if (
+        not isinstance(provider_symbol, str)
+        or not provider_symbol
+        or provider_symbol != provider_symbol.strip()
+    ):
+        raise PriceNormalizationError(
+            f"Yahoo chart result for {ticker} lacks a valid 'symbol' identifier."
+        )
+    expected_symbol = ticker.upper()
+    if provider_symbol != expected_symbol:
+        raise PriceNormalizationError(
+            f"Yahoo chart result identifies symbol {provider_symbol!r}, not "
+            f"requested symbol {expected_symbol!r}."
         )
     exchange_timezone = meta.get("exchangeTimezoneName")
     if not isinstance(exchange_timezone, str) or not exchange_timezone:
@@ -503,10 +530,19 @@ def _raw_chart_to_provider_frame(payload: object, ticker: str) -> pd.DataFrame:
             "market datetimes."
         ) from error
     market_index.name = "Date"
-    # Raw JSON nulls can otherwise leave an all-missing source column as object
-    # dtype. The adapter has already rejected non-numeric values, so float64
-    # preserves source missingness while satisfying the provider dtype boundary.
-    provider_frame = pd.DataFrame(frame_values, index=market_index, dtype="float64")
+    provider_columns: dict[str, pd.Series] = {}
+    for field, values in frame_values.items():
+        try:
+            provider_columns[field] = build_lossless_real_numeric_series(
+                values, name=field
+            )
+        except NumericDtypeHarmonizationError as error:
+            raise PriceNormalizationError(
+                f"Yahoo chart field {field!r} for {ticker} cannot be represented "
+                "losslessly as a supported raw numeric Series."
+            ) from error
+    provider_frame = pd.DataFrame(provider_columns)
+    provider_frame.index = market_index
     return cast(
         pd.DataFrame, yf_utils.fix_Yahoo_dst_issue(provider_frame, interval="1d")
     )
@@ -780,6 +816,9 @@ def download_price_history(
                     first_date=None,
                     last_date=None,
                     retrieved_at=None,
+                    query_start=start_date,
+                    query_end=end_date,
+                    returned_dates=(),
                     error=error_message,
                 )
             )
@@ -795,19 +834,26 @@ def download_price_history(
                     first_date=None,
                     last_date=None,
                     retrieved_at=response_timestamp,
+                    query_start=start_date,
+                    query_end=end_date,
+                    returned_dates=(),
                 )
             )
             continue
 
+        returned_dates = tuple(normalized["date"].dt.date)
         successful_frames.append(normalized)
         statuses.append(
             TickerDownloadStatus(
                 ticker=ticker,
                 status="success",
                 rows_received=len(normalized),
-                first_date=normalized["date"].min().date(),
-                last_date=normalized["date"].max().date(),
+                first_date=returned_dates[0],
+                last_date=returned_dates[-1],
                 retrieved_at=response_timestamp,
+                query_start=start_date,
+                query_end=end_date,
+                returned_dates=returned_dates,
             )
         )
 
@@ -1108,10 +1154,180 @@ def _harmonize_price_numeric_dtypes(
     return harmonized_existing, harmonized_incoming
 
 
+def _validate_price_retrieval_statuses(
+    incoming: pd.DataFrame,
+    retrieval_statuses: Sequence[TickerDownloadStatus],
+) -> tuple[TickerDownloadStatus, ...]:
+    """Validate that coverage metadata describes the same canonical batch."""
+
+    statuses = tuple(retrieval_statuses)
+    seen_tickers: set[str] = set()
+    successful_statuses: list[TickerDownloadStatus] = []
+    for status in statuses:
+        if not isinstance(status, TickerDownloadStatus):
+            raise PriceDataValidationError(
+                "Price retrieval coverage must contain TickerDownloadStatus values."
+            )
+        if (
+            not isinstance(status.ticker, str)
+            or not status.ticker
+            or status.ticker != status.ticker.strip()
+        ):
+            raise PriceDataValidationError(
+                "Price retrieval coverage tickers must be non-empty strings "
+                "without surrounding whitespace."
+            )
+        ticker_key = status.ticker.casefold()
+        if ticker_key in seen_tickers:
+            raise PriceDataValidationError(
+                f"Price retrieval coverage contains duplicate ticker {status.ticker!r}."
+            )
+        seen_tickers.add(ticker_key)
+        if type(status.query_start) is not date or type(status.query_end) is not date:
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} must use date bounds."
+            )
+        if status.query_start >= status.query_end:
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} has an invalid "
+                "query window."
+            )
+        if not isinstance(status.returned_dates, tuple) or any(
+            type(value) is not date for value in status.returned_dates
+        ):
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} must contain a "
+                "tuple of returned dates."
+            )
+        if status.returned_dates != tuple(sorted(set(status.returned_dates))):
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} must contain "
+                "unique dates in ascending order."
+            )
+        if any(
+            value < status.query_start or value >= status.query_end
+            for value in status.returned_dates
+        ):
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} contains returned "
+                "dates outside its query window."
+            )
+
+        if status.status == "success":
+            expected_first = status.returned_dates[0] if status.returned_dates else None
+            expected_last = status.returned_dates[-1] if status.returned_dates else None
+            if (
+                not status.returned_dates
+                or status.rows_received != len(status.returned_dates)
+                or status.first_date != expected_first
+                or status.last_date != expected_last
+                or status.retrieved_at is None
+                or status.error is not None
+            ):
+                raise PriceDataValidationError(
+                    f"Successful price retrieval coverage for {status.ticker} is "
+                    "internally inconsistent."
+                )
+            successful_statuses.append(status)
+        elif status.status == "empty":
+            if (
+                status.rows_received != 0
+                or status.first_date is not None
+                or status.last_date is not None
+                or status.returned_dates
+                or status.retrieved_at is None
+                or status.error is not None
+            ):
+                raise PriceDataValidationError(
+                    f"Empty price retrieval coverage for {status.ticker} is "
+                    "internally inconsistent."
+                )
+        elif status.status == "failed":
+            if (
+                status.rows_received != 0
+                or status.first_date is not None
+                or status.last_date is not None
+                or status.returned_dates
+                or status.retrieved_at is not None
+            ):
+                raise PriceDataValidationError(
+                    f"Failed price retrieval coverage for {status.ticker} is "
+                    "internally inconsistent."
+                )
+        else:
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} has unsupported "
+                f"status {status.status!r}."
+            )
+
+    incoming_tickers = set(incoming["ticker"].array)
+    successful_tickers = {status.ticker for status in successful_statuses}
+    if incoming_tickers != successful_tickers:
+        raise PriceDataValidationError(
+            "Successful price retrieval coverage tickers do not exactly match "
+            f"incoming canonical tickers: coverage={sorted(successful_tickers)}, "
+            f"incoming={sorted(incoming_tickers)}."
+        )
+
+    for status in successful_statuses:
+        ticker_rows = incoming.loc[incoming["ticker"].eq(status.ticker)]
+        incoming_dates = tuple(
+            ticker_rows["date"].sort_values(kind="mergesort").dt.date
+        )
+        if incoming_dates != status.returned_dates:
+            raise PriceDataValidationError(
+                f"Price retrieval coverage dates for {status.ticker} do not "
+                "exactly match the incoming canonical rows."
+            )
+        try:
+            status_timestamp = _retrieval_timestamp(cast(datetime, status.retrieved_at))
+        except ValueError as error:
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} has an invalid "
+                "retrieved_at timestamp."
+            ) from error
+        if not ticker_rows["retrieved_at"].eq(pd.Timestamp(status_timestamp)).all():
+            raise PriceDataValidationError(
+                f"Price retrieval coverage timestamp for {status.ticker} does not "
+                "match the incoming canonical rows."
+            )
+
+    return tuple(successful_statuses)
+
+
+def _reject_vanished_price_observations(
+    existing: pd.DataFrame,
+    successful_statuses: Sequence[TickerDownloadStatus],
+) -> None:
+    vanished_keys: list[tuple[str, str]] = []
+    for status in sorted(successful_statuses, key=lambda item: item.ticker):
+        in_coverage = (
+            existing["ticker"].eq(status.ticker)
+            & existing["date"].ge(pd.Timestamp(status.query_start))
+            & existing["date"].lt(pd.Timestamp(status.query_end))
+        )
+        existing_dates = existing.loc[in_coverage, "date"]
+        returned_dates = pd.DatetimeIndex(status.returned_dates)
+        vanished_dates = existing_dates.loc[~existing_dates.isin(returned_dates)]
+        vanished_keys.extend(
+            (status.ticker, value.date().isoformat())
+            for value in vanished_dates.sort_values()
+        )
+
+    if vanished_keys:
+        raise PriceDataValidationError(
+            "Previously stored price observations vanished from a later "
+            "successful provider response inside confirmed coverage: "
+            f"{vanished_keys}. The transaction was rejected for manual review; "
+            "no rows were deleted."
+        )
+
+
 def persist_price_history(
     incoming_data: pd.DataFrame,
     output_path: Path,
     *,
+    retrieval_statuses: Sequence[TickerDownloadStatus] | None = None,
     snapshot_dir: Path | None = None,
     snapshot_time: datetime | None = None,
 ) -> PricePersistenceResult:
@@ -1123,13 +1339,21 @@ def persist_price_history(
     only after the exact superseded canonical Parquet file is safely
     snapshotted. Incoming rows that lose previously available market fields are
     rejected so fields from different source vintages are never silently
-    combined. An adjacent cross-process lock serializes the complete read,
-    validation, merge, snapshot, and atomic canonical replacement for this
-    output path.
+    combined. When same-batch retrieval statuses are supplied, a successful
+    ticker response that omits an existing observation inside its confirmed
+    query window is rejected for manual review; the row is neither retained as
+    a current response nor auto-deleted. Empty, failed, and unrequested tickers
+    do not trigger this check. An adjacent cross-process lock serializes the
+    complete read, coverage comparison, validation, merge, snapshot, and atomic
+    canonical replacement for this output path.
 
     Args:
         incoming_data: Newly downloaded canonical observations.
         output_path: Destination Parquet path.
+        retrieval_statuses: Optional structured outcomes from the same
+            ``download_price_history`` result. Production refreshes pass these
+            statuses to establish successful query coverage. When omitted, no
+            absence claim can be made and no disappearance check is applied.
         snapshot_dir: Destination for superseded canonical vintages. Defaults to
             ``data/snapshots/prices`` through the existing project path helper
             and is resolved only when a revision requires a snapshot.
@@ -1159,6 +1383,13 @@ def persist_price_history(
         validate_price_data(incoming)
         if incoming.empty:
             raise ValueError("No price observations are available to persist.")
+        successful_statuses: tuple[TickerDownloadStatus, ...] = ()
+        if retrieval_statuses is not None:
+            successful_statuses = _validate_price_retrieval_statuses(
+                incoming, retrieval_statuses
+            )
+        if existing is not None and successful_statuses:
+            _reject_vanished_price_observations(existing, successful_statuses)
 
         revised_row_count = 0
         revised_tickers: tuple[str, ...] = ()

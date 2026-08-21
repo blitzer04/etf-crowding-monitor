@@ -109,6 +109,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         persistence = persist_price_history(
             result.prices,
             output_path,
+            retrieval_statuses=result.statuses,
             snapshot_dir=get_snapshot_data_dir() / "prices",
         )
     except (OSError, ValueError) as error:

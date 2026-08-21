@@ -20,13 +20,13 @@ from typing import BinaryIO, Literal
 
 import pandas as pd
 import yfinance as yf  # type: ignore[import-untyped]
-from pandas.api.extensions import ExtensionArray
 from pandas.api.types import is_any_real_numeric_dtype
 from yfinance import utils as yf_utils  # type: ignore[import-untyped]
 from yfinance.const import _BASE_URL_  # type: ignore[import-untyped]
 
 from etf_crowding.data.numeric_dtypes import (
     NumericDtypeHarmonizationError,
+    build_lossless_real_numeric_series,
     harmonize_real_numeric_series,
 )
 from etf_crowding.data.share_validation import (
@@ -393,6 +393,30 @@ def _raw_shares_to_provider_series(
         raise SharesNormalizationError(
             f"Malformed yfinance shares payload for {ticker}: invalid result."
         )
+    metadata = result.get("meta")
+    if not isinstance(metadata, dict):
+        raise SharesNormalizationError(
+            f"Malformed yfinance shares payload for {ticker}: missing result metadata."
+        )
+    provider_symbols = metadata.get("symbol")
+    if (
+        not isinstance(provider_symbols, list)
+        or len(provider_symbols) != 1
+        or not isinstance(provider_symbols[0], str)
+        or not provider_symbols[0]
+        or provider_symbols[0] != provider_symbols[0].strip()
+    ):
+        raise SharesNormalizationError(
+            f"Malformed yfinance shares payload for {ticker}: result metadata "
+            "must contain one valid symbol identifier."
+        )
+    provider_symbol = provider_symbols[0]
+    expected_symbol = ticker.upper()
+    if provider_symbol != expected_symbol:
+        raise SharesNormalizationError(
+            f"Yahoo shares result identifies symbol {provider_symbol!r}, not "
+            f"requested symbol {expected_symbol!r}."
+        )
     if "shares_out" not in result:
         return None
 
@@ -435,19 +459,17 @@ def _raw_shares_to_provider_series(
             f"Malformed yfinance shares dates for {ticker}: {error}."
         ) from error
 
-    all_integer_or_missing = all(
-        value is None or isinstance(value, int) for value in shares_values
-    )
-    provider_values: ExtensionArray
-    if all_integer_or_missing:
-        provider_values = pd.array(shares_values, dtype="Int64")
-    else:
-        provider_values = pd.array(shares_values, dtype="Float64")
-    return pd.Series(
-        provider_values,
-        index=provider_index,
-        name="shares_out",
-    ).sort_index(kind="mergesort")
+    try:
+        provider_values = build_lossless_real_numeric_series(
+            shares_values, name="shares_out"
+        )
+    except NumericDtypeHarmonizationError as error:
+        raise SharesNormalizationError(
+            f"Yahoo shares_out values for {ticker} cannot be represented "
+            "losslessly as one supported raw numeric Series."
+        ) from error
+    provider_values.index = provider_index
+    return provider_values.sort_index(kind="mergesort")
 
 
 def _download_yfinance_ticker(

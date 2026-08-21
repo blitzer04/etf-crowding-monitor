@@ -5,9 +5,10 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -16,7 +17,7 @@ import pytest
 from pandas.api.types import is_any_real_numeric_dtype
 
 import etf_crowding.data.prices as price_module
-from etf_crowding.data.prices import persist_price_history
+from etf_crowding.data.prices import TickerDownloadStatus, persist_price_history
 from etf_crowding.data.validation import (
     PRICE_VALUE_COLUMNS,
     PriceDataValidationError,
@@ -108,6 +109,30 @@ def _large_integer_price_row(
         row[column] = pd.Series([value], index=row.index, dtype=dtype)
     row["retrieved_at"] = retrieved_at
     return row
+
+
+def _retrieval_status(
+    ticker: str,
+    status: Literal["success", "empty", "failed"],
+    returned_dates: tuple[str, ...] = (),
+    *,
+    start: str = "2024-01-01",
+    end: str = "2024-01-05",
+    retrieved_at: datetime | None = RETRIEVED_AT,
+) -> TickerDownloadStatus:
+    resolved_dates = tuple(date.fromisoformat(value) for value in returned_dates)
+    return TickerDownloadStatus(
+        ticker=ticker,
+        status=status,
+        rows_received=len(resolved_dates),
+        first_date=min(resolved_dates) if resolved_dates else None,
+        last_date=max(resolved_dates) if resolved_dates else None,
+        retrieved_at=None if status == "failed" else retrieved_at,
+        error="synthetic failure" if status == "failed" else None,
+        query_start=date.fromisoformat(start),
+        query_end=date.fromisoformat(end),
+        returned_dates=resolved_dates,
+    )
 
 
 def _price_row_with_decimal(value: Decimal | None) -> pd.DataFrame:
@@ -1659,3 +1684,354 @@ def test_mixed_price_representation_preserves_missing_watermark_and_revisions(
     assert revised_result.prices["close"].iloc[0] == 102.5
     assert pd.isna(revised_result.prices["adjusted_close"].iloc[0])
     assert revised_result.prices["retrieved_at"].iloc[0] == revision_time
+
+
+@pytest.mark.parametrize(
+    "row_order",
+    [pytest.param([0, 1], id="ascending"), pytest.param([1, 0], id="reversed")],
+)
+def test_successful_coverage_date_matching_is_independent_of_incoming_row_order(
+    tmp_path: Path,
+    row_order: list[int],
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    existing = _canonical_prices()
+    persist_price_history(existing, output_path)
+    incoming = existing.iloc[row_order].reset_index(drop=True)
+    incoming["retrieved_at"] = NEW_RETRIEVED_AT
+
+    result = persist_price_history(
+        incoming,
+        output_path,
+        retrieval_statuses=(
+            _retrieval_status(
+                "SPY",
+                "success",
+                ("2024-01-02", "2024-01-03"),
+                retrieved_at=NEW_RETRIEVED_AT.to_pydatetime(),
+            ),
+        ),
+    )
+
+    assert result.prices["date"].tolist() == [
+        pd.Timestamp("2024-01-02"),
+        pd.Timestamp("2024-01-03"),
+    ]
+    assert result.prices["retrieved_at"].eq(NEW_RETRIEVED_AT).all()
+
+
+def test_coverage_validation_does_not_hide_conflicting_duplicate_date(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    incoming = _canonical_prices()
+    conflict = incoming.iloc[[0]].copy()
+    conflict["close"] = 102.5
+    duplicated = pd.concat([incoming, conflict], ignore_index=True)
+
+    with pytest.raises(PriceDataValidationError, match="Conflicting market values"):
+        persist_price_history(
+            duplicated,
+            output_path,
+            retrieval_statuses=(
+                _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03")),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("row_order", "returned_dates"),
+    [
+        pytest.param([0], ("2024-01-02", "2024-01-03"), id="missing-date"),
+        pytest.param([0, 1], ("2024-01-02",), id="extra-date"),
+    ],
+)
+def test_coverage_dates_must_exactly_match_incoming_rows(
+    tmp_path: Path,
+    row_order: list[int],
+    returned_dates: tuple[str, ...],
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    incoming = _canonical_prices().iloc[row_order].reset_index(drop=True)
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match="coverage dates.*do not exactly match",
+    ):
+        persist_price_history(
+            incoming,
+            output_path,
+            retrieval_statuses=(_retrieval_status("SPY", "success", returned_dates),),
+        )
+
+
+def test_coverage_ticker_must_exactly_match_incoming_rows(tmp_path: Path) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    incoming = _canonical_prices()
+    incoming["ticker"] = "QQQ"
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match="coverage tickers do not exactly match",
+    ):
+        persist_price_history(
+            incoming,
+            output_path,
+            retrieval_statuses=(
+                _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03")),
+            ),
+        )
+
+
+def test_coverage_timestamp_must_match_incoming_rows(tmp_path: Path) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match="coverage timestamp.*does not match",
+    ):
+        persist_price_history(
+            _canonical_prices(),
+            output_path,
+            retrieval_statuses=(
+                _retrieval_status(
+                    "SPY",
+                    "success",
+                    ("2024-01-02", "2024-01-03"),
+                    retrieved_at=NEW_RETRIEVED_AT.to_pydatetime(),
+                ),
+            ),
+        )
+
+
+def test_in_coverage_vanished_price_rejects_transaction_without_snapshot(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    snapshot_dir = tmp_path / "snapshots" / "prices"
+    existing = _canonical_prices()
+    persist_price_history(existing, output_path)
+    canonical_bytes = output_path.read_bytes()
+    incoming = existing.iloc[[0]].copy()
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match=r"vanished.*\('SPY', '2024-01-03'\).*manual review",
+    ):
+        persist_price_history(
+            incoming,
+            output_path,
+            retrieval_statuses=(_retrieval_status("SPY", "success", ("2024-01-02",)),),
+            snapshot_dir=snapshot_dir,
+            snapshot_time=SNAPSHOT_TIME,
+        )
+
+    assert output_path.read_bytes() == canonical_bytes
+    assert not snapshot_dir.exists()
+
+
+def test_all_vanished_price_keys_are_reported_deterministically(tmp_path: Path) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    spy = _canonical_prices()
+    qqq = spy.copy()
+    qqq["ticker"] = "QQQ"
+    existing = pd.concat([qqq, spy], ignore_index=True)
+    persist_price_history(existing, output_path)
+    incoming_spy = _appended_price_row("2024-01-04")
+    incoming_qqq = incoming_spy.copy()
+    incoming_qqq["ticker"] = "QQQ"
+    incoming = pd.concat([incoming_spy, incoming_qqq], ignore_index=True)
+
+    with pytest.raises(PriceDataValidationError) as error_info:
+        persist_price_history(
+            incoming,
+            output_path,
+            retrieval_statuses=(
+                _retrieval_status(
+                    "SPY",
+                    "success",
+                    ("2024-01-04",),
+                    retrieved_at=NEW_RETRIEVED_AT.to_pydatetime(),
+                ),
+                _retrieval_status(
+                    "QQQ",
+                    "success",
+                    ("2024-01-04",),
+                    retrieved_at=NEW_RETRIEVED_AT.to_pydatetime(),
+                ),
+            ),
+        )
+
+    error_message = str(error_info.value)
+    expected_keys = [
+        "('QQQ', '2024-01-02')",
+        "('QQQ', '2024-01-03')",
+        "('SPY', '2024-01-02')",
+        "('SPY', '2024-01-03')",
+    ]
+    assert all(key in error_message for key in expected_keys)
+    assert [error_message.index(key) for key in expected_keys] == sorted(
+        error_message.index(key) for key in expected_keys
+    )
+
+
+def test_existing_price_outside_successful_coverage_is_preserved(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    existing = _canonical_prices().iloc[[0]].copy()
+    persist_price_history(existing, output_path)
+    incoming = _appended_price_row("2024-01-03")
+
+    result = persist_price_history(
+        incoming,
+        output_path,
+        retrieval_statuses=(
+            _retrieval_status(
+                "SPY",
+                "success",
+                ("2024-01-03",),
+                start="2024-01-03",
+                end="2024-01-04",
+                retrieved_at=NEW_RETRIEVED_AT.to_pydatetime(),
+            ),
+        ),
+    )
+
+    assert result.prices["date"].tolist() == [
+        pd.Timestamp("2024-01-02"),
+        pd.Timestamp("2024-01-03"),
+    ]
+
+
+@pytest.mark.parametrize("non_success_status", ["failed", "empty"])
+def test_failed_or_empty_ticker_does_not_trigger_disappearance(
+    tmp_path: Path,
+    non_success_status: str,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    spy = _canonical_prices()
+    qqq = spy.copy()
+    qqq["ticker"] = "QQQ"
+    existing = pd.concat([spy, qqq], ignore_index=True)
+    persist_price_history(existing, output_path)
+
+    result = persist_price_history(
+        spy,
+        output_path,
+        retrieval_statuses=(
+            _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03")),
+            _retrieval_status("QQQ", non_success_status),
+        ),
+    )
+
+    assert set(result.prices["ticker"]) == {"SPY", "QQQ"}
+    assert len(result.prices.loc[result.prices["ticker"].eq("QQQ")]) == 2
+
+
+def test_unrequested_ticker_is_untouched_by_successful_coverage(tmp_path: Path) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    spy = _canonical_prices()
+    qqq = spy.copy()
+    qqq["ticker"] = "QQQ"
+    persist_price_history(pd.concat([spy, qqq], ignore_index=True), output_path)
+
+    result = persist_price_history(
+        spy,
+        output_path,
+        retrieval_statuses=(
+            _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03")),
+        ),
+    )
+
+    assert len(result.prices.loc[result.prices["ticker"].eq("QQQ")]) == 2
+
+
+def test_identical_successful_refresh_with_coverage_advances_provenance(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    existing = _canonical_prices()
+    persist_price_history(existing, output_path)
+    incoming = existing.copy()
+    incoming["retrieved_at"] = NEW_RETRIEVED_AT
+
+    result = persist_price_history(
+        incoming,
+        output_path,
+        retrieval_statuses=(
+            _retrieval_status(
+                "SPY",
+                "success",
+                ("2024-01-02", "2024-01-03"),
+                retrieved_at=NEW_RETRIEVED_AT.to_pydatetime(),
+            ),
+        ),
+    )
+
+    assert result.revised_row_count == 0
+    assert result.snapshot_path is None
+    assert result.prices["retrieved_at"].eq(NEW_RETRIEVED_AT).all()
+
+
+def test_genuine_revision_with_complete_coverage_keeps_snapshot_policy(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    snapshot_dir = tmp_path / "snapshots" / "prices"
+    existing = _canonical_prices()
+    persist_price_history(existing, output_path)
+    canonical_bytes = output_path.read_bytes()
+    revision = existing.copy()
+    revision["adjusted_close"] += 0.25
+    revision["retrieved_at"] = NEW_RETRIEVED_AT
+
+    result = persist_price_history(
+        revision,
+        output_path,
+        retrieval_statuses=(
+            _retrieval_status(
+                "SPY",
+                "success",
+                ("2024-01-02", "2024-01-03"),
+                retrieved_at=NEW_RETRIEVED_AT.to_pydatetime(),
+            ),
+        ),
+        snapshot_dir=snapshot_dir,
+        snapshot_time=SNAPSHOT_TIME,
+    )
+
+    assert result.revised_row_count == 2
+    assert result.snapshot_path is not None
+    assert result.snapshot_path.read_bytes() == canonical_bytes
+
+
+def test_later_canonical_change_cannot_bypass_locked_disappearance_check(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    returned_row = _appended_price_row("2024-01-03", retrieved_at=NEW_RETRIEVED_AT)
+    stale_coverage = (
+        _retrieval_status(
+            "SPY",
+            "success",
+            ("2024-01-03",),
+            retrieved_at=NEW_RETRIEVED_AT.to_pydatetime(),
+        ),
+    )
+    persist_price_history(returned_row, output_path)
+    concurrent_row = _canonical_prices().iloc[[0]].copy()
+    persist_price_history(concurrent_row, output_path)
+    canonical_after_concurrent_write = output_path.read_bytes()
+
+    with pytest.raises(
+        PriceDataValidationError,
+        match=r"\('SPY', '2024-01-02'\)",
+    ):
+        persist_price_history(
+            returned_row,
+            output_path,
+            retrieval_statuses=stale_coverage,
+        )
+
+    assert output_path.read_bytes() == canonical_after_concurrent_write

@@ -62,9 +62,10 @@ applied retroactively because that would introduce look-ahead bias. Definitions,
 alignment rules, and limitations are documented in
 [`docs/methodology.md`](docs/methodology.md).
 
-The historical daily price-ingestion layer is implemented, but no factor
-calculations, weights, thresholds, scores, or empirical conclusions have been
-implemented yet.
+Historical daily price ingestion/persistence and historical shares-outstanding
+ingestion/persistence are implemented. The creation/redemption flow proxy, Day
+4 signal construction, factor weights, thresholds, composite scores, backtests,
+application work, and empirical conclusions are not implemented yet.
 
 ## Planned project architecture
 
@@ -160,6 +161,12 @@ normal concurrent live-ingestion policy. This is a deliberate private-interface
 dependency. Provider upgrades require source review and offline integration-test
 updates before changing that exact pin.
 
+Before assigning the requested ticker to raw chart values, the adapter requires
+the scalar identifier at `chart.result[0].meta.symbol` and compares it with the
+uppercase symbol convention used by yfinance 1.5.2. A missing, malformed, or
+conflicting identifier rejects that ticker response; it is never silently
+relabeled and no heuristic alias mapping is used.
+
 ### Canonical daily price schema
 
 | Column | Definition |
@@ -182,6 +189,15 @@ SparseDtype and PyArrow decimal are currently unsupported. Boolean, complex,
 string, object, datetime, timedelta, categorical, sparse, decimal, and other
 unsupported dtypes are rejected before persistence; they are never converted
 into plausible market values.
+
+Raw JSON numeric arrays are materialized per field without DataFrame or NumPy
+float inference. Integers, floats, and nulls are combined only when one supported
+representation preserves every source value and missing state exactly. The
+established normalized price output remains `float64`; each raw market Series
+must round-trip exactly through that conversion. An integer such as
+`9_007_199_254_740_993` is retained exactly at the raw boundary but rejected
+before canonical assignment because binary `float64` cannot represent it
+exactly. It is never silently rounded. Explicit zero and null remain distinct.
 
 The adapter reads Yahoo chart quote arrays before yfinance's high-level history
 transformations, so no `Adj Close / Close` automatic OHLC adjustment or back
@@ -237,12 +253,22 @@ superseded.
 An incoming overlap that loses a previously available market value is rejected
 for manual review rather than erasing data or mixing fields from different
 source vintages. Non-requested, empty, or failed tickers retain their existing
-history. A deterministic adjacent lock file serializes each canonical output's
-complete existing-file read, validation, merge, required snapshot, and atomic
-replacement transaction. Lock acquisition times out clearly after 30 seconds;
-unrelated custom output paths use independent locks. The lock file is only
-coordination metadata and is not a market dataset. Generated processed data and
-snapshots are ignored by Git.
+history. The production updater passes each ticker's success status, exact
+inclusive-start/exclusive-end request window, returned dates, and retrieval
+timestamp into the same persistence transaction. While holding the output lock,
+the transaction compares only existing ticker/date rows inside each successful
+window with that response's returned dates. If a previously stored in-window
+date vanishes, the entire update is rejected for manual review, the canonical
+file remains unchanged, no revision snapshot is created, and the affected keys
+are reported. Vanished rows are not auto-deleted. Dates outside coverage and
+history for empty, failed, or unrequested tickers remain untouched; weekends,
+holidays, and other nonexistent calendar rows are never inferred. A
+deterministic adjacent lock file serializes each canonical output's complete
+existing-file read, validation, coverage comparison, merge, required snapshot,
+and atomic replacement transaction. Lock acquisition times out clearly after
+30 seconds; unrelated custom output paths use independent locks. The lock file
+is only coordination metadata and is not a market dataset. Generated processed
+data and snapshots are ignored by Git.
 
 Market-data coverage, field availability, adjustment calculations, revisions,
 rate limits, and service continuity depend on yfinance and Yahoo Finance. This
@@ -283,6 +309,11 @@ retains yfinance session, cookie/crumb, configured retry, HTTP-error, and
 rate-limit handling without adding a project HTTP client. The non-expiring
 `cache_get` response cache is deliberately bypassed.
 
+Before assigning the requested ticker, the raw parser requires the single
+provider symbol in `timeseries.result[0].meta.symbol` and compares it with
+yfinance 1.5.2's uppercase requested-symbol convention. Missing, malformed, or
+conflicting identity metadata rejects the response without alias heuristics.
+
 ### Canonical shares-outstanding schema
 
 | Column | Definition |
@@ -310,6 +341,13 @@ floating Series remain missing. Canonical column labels must be unique, and
 duplicate ticker/date values must be identical to deduplicate; conflicting
 duplicates are invalid.
 
+The raw shares parser constructs integer and floating source values separately
+before applying the shared lossless numeric harmonization policy. This prevents
+a mixed large-integer/float payload from passing through constructor inference.
+Integer/null values preserve both the integer and missing state; exactly
+representable integer/float combinations remain valid; incompatible combinations
+raise a domain error before canonical normalization.
+
 The canonical Parquet represents the latest successfully validated source
 vintage observed by this project. For each persisted ticker/date row,
 `retrieved_at` is the latest client-side retrieval time at which the project
@@ -325,6 +363,12 @@ per-output lock serializes the complete read, validation, merge, snapshot, and
 atomic replacement transaction with a 30-second timeout. Partial batches retain
 history for failed, empty, and unrequested tickers; an entirely empty or failed
 batch cannot replace canonical history.
+
+Shares observations intentionally remain sparse, and the inspected pinned
+fundamentals-timeseries implementation does not establish exact response-bound
+inclusivity. The price disappearance rule is therefore not copied to shares:
+absence of a sparse shares date is not treated as proof that an observation
+vanished inside confirmed coverage.
 
 No live Yahoo request was used to establish Day 3. Actual ETF availability,
 history depth, source observation frequency, revisions, and null patterns are
@@ -346,7 +390,8 @@ provider upgrade.
 Day 1 established the repository foundation and canonical ETF universe. Day 2
 implements historical daily price ingestion. Day 3 implements the historical
 shares-outstanding ingestion, validation, incremental Parquet persistence, and
-command-line update workflow. Creation/redemption flow proxies, holdings,
+command-line update workflow. The creation/redemption flow proxy, Day 4 signal
+construction, holdings,
 concentration, momentum, volatility, crowding scores, backtests, analysis case
 studies, and Streamlit pages are not yet implemented.
 

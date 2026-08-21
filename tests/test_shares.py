@@ -16,6 +16,7 @@ from etf_crowding.data.shares import (
     SharesNormalizationError,
     download_shares_history,
     normalize_yfinance_shares_output,
+    persist_shares_history,
 )
 
 RETRIEVED_AT = datetime(2026, 8, 14, 10, 0, tzinfo=UTC)
@@ -38,9 +39,13 @@ def _raw_shares_payload(
     dates: tuple[str, ...] = ("2024-01-02", "2024-01-03"),
     values: list[object] | None = None,
     include_shares: bool = True,
+    symbol: object = "SPY",
 ) -> dict[str, object]:
     result: dict[str, object] = {
-        "timestamp": [int(pd.Timestamp(value, tz="UTC").timestamp()) for value in dates]
+        "meta": {"symbol": [symbol], "type": ["shares_out"]},
+        "timestamp": [
+            int(pd.Timestamp(value, tz="UTC").timestamp()) for value in dates
+        ],
     }
     if include_shares:
         result["shares_out"] = (
@@ -573,7 +578,7 @@ def test_omitted_bounds_use_one_batch_reference_and_keep_response_timestamps(
     captured: dict[str, object] = {}
     _install_raw_yfinance_ticker(
         monkeypatch,
-        [_raw_shares_payload(), _raw_shares_payload()],
+        [_raw_shares_payload(), _raw_shares_payload(symbol="QQQ")],
         captured=captured,
     )
     reference_times = iter(
@@ -698,7 +703,7 @@ def test_explicit_start_and_omitted_end_share_one_batch_reference(
     captured: dict[str, object] = {}
     _install_raw_yfinance_ticker(
         monkeypatch,
-        [_raw_shares_payload(), _raw_shares_payload()],
+        [_raw_shares_payload(), _raw_shares_payload(symbol="QQQ")],
         captured=captured,
     )
     batch_reference = datetime(2026, 8, 15, 3, 59, tzinfo=UTC)
@@ -826,6 +831,269 @@ def test_raw_null_shares_are_preserved_as_nullable_numeric(
     assert pd.isna(result.shares["shares_outstanding"].iloc[0])
     assert result.shares["shares_outstanding"].iloc[1] == 101_000_000
     assert str(result.shares["shares_outstanding"].dtype) == "Int64"
+
+
+def test_raw_large_integer_shares_survive_provider_normalization_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    large_integer = 9_007_199_254_740_993
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        [_raw_shares_payload(values=[large_integer, None])],
+    )
+
+    result = download_shares_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-02-01",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.successful_tickers == ("SPY",)
+    assert result.shares["shares_outstanding"].iloc[0] == large_integer
+    assert pd.isna(result.shares["shares_outstanding"].iloc[1])
+    assert str(result.shares["shares_outstanding"].dtype) == "Int64"
+
+
+def test_raw_uint64_boundaries_survive_provider_and_batch_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spy_values = [2**53 + 1, 2**63]
+    qqq_values = [2**64 - 1, 1.0]
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        [
+            _raw_shares_payload(values=spy_values, symbol="SPY"),
+            _raw_shares_payload(values=qqq_values, symbol="QQQ"),
+        ],
+    )
+
+    result = download_shares_history(
+        ["SPY", "QQQ"],
+        start="2024-01-01",
+        end="2024-02-01",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.successful_tickers == ("SPY", "QQQ")
+    assert str(result.shares["shares_outstanding"].dtype) == "UInt64"
+    assert (
+        result.shares.loc[
+            result.shares["ticker"].eq("SPY"), "shares_outstanding"
+        ].tolist()
+        == spy_values
+    )
+    assert result.shares.loc[
+        result.shares["ticker"].eq("QQQ"), "shares_outstanding"
+    ].tolist() == [2**64 - 1, 1]
+
+
+def test_raw_uint64_max_survives_canonical_parquet_round_trip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_values = [2**64 - 1, 1.0]
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        [_raw_shares_payload(values=raw_values)],
+    )
+    downloaded = download_shares_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-02-01",
+        retrieved_at=RETRIEVED_AT,
+    )
+    output_path = tmp_path / "shares.parquet"
+
+    persist_shares_history(downloaded.shares, output_path)
+    reloaded = pd.read_parquet(output_path)
+
+    assert str(reloaded["shares_outstanding"].dtype) == "UInt64"
+    assert reloaded["shares_outstanding"].tolist() == [2**64 - 1, 1]
+
+
+def test_raw_large_integer_shares_survive_parquet_round_trip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    large_integer = 9_007_199_254_740_993
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        [_raw_shares_payload(values=[large_integer, None])],
+    )
+    downloaded = download_shares_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-02-01",
+        retrieved_at=RETRIEVED_AT,
+    )
+    output_path = tmp_path / "shares.parquet"
+
+    persist_shares_history(downloaded.shares, output_path)
+    reloaded = pd.read_parquet(output_path)
+
+    assert reloaded["shares_outstanding"].iloc[0] == large_integer
+    assert pd.isna(reloaded["shares_outstanding"].iloc[1])
+
+
+def test_raw_exactly_representable_integer_float_shares_remain_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        [_raw_shares_payload(values=[100_000_000, 100_000_000.5])],
+    )
+
+    result = download_shares_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-02-01",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.successful_tickers == ("SPY",)
+    assert result.shares["shares_outstanding"].tolist() == [
+        100_000_000.0,
+        100_000_000.5,
+    ]
+
+
+def test_raw_inexact_integer_float_shares_fail_before_corruption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        [_raw_shares_payload(values=[9_007_199_254_740_993, 100.5])],
+    )
+
+    result = download_shares_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-02-01",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.failed_tickers == ("SPY",)
+    assert result.shares.empty
+    assert "cannot be represented losslessly" in (result.statuses[0].error or "")
+
+
+def test_matching_shares_metadata_symbol_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        [_raw_shares_payload(symbol="SPY")],
+    )
+
+    result = download_shares_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-02-01",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.successful_tickers == ("SPY",)
+
+
+def test_mismatched_shares_metadata_symbol_never_reaches_canonical_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        [_raw_shares_payload(symbol="QQQ")],
+    )
+
+    result = download_shares_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-02-01",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.failed_tickers == ("SPY",)
+    assert result.shares.empty
+    assert "identifies symbol 'QQQ', not requested symbol 'SPY'" in (
+        result.statuses[0].error or ""
+    )
+
+
+@pytest.mark.parametrize(
+    "symbol_metadata",
+    [None, "SPY", [], ["SPY", "QQQ"], [123], [" SPY "]],
+)
+def test_missing_or_malformed_shares_metadata_symbol_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    symbol_metadata: object,
+) -> None:
+    payload = _raw_shares_payload()
+    timeseries = payload["timeseries"]
+    assert isinstance(timeseries, dict)
+    results = timeseries["result"]
+    assert isinstance(results, list)
+    result_payload = results[0]
+    assert isinstance(result_payload, dict)
+    metadata = result_payload["meta"]
+    assert isinstance(metadata, dict)
+    if symbol_metadata is None:
+        del metadata["symbol"]
+    else:
+        metadata["symbol"] = symbol_metadata
+    _install_raw_yfinance_ticker(monkeypatch, [payload])
+
+    result = download_shares_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-02-01",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.failed_tickers == ("SPY",)
+    assert result.shares.empty
+    assert "one valid symbol identifier" in (result.statuses[0].error or "")
+
+
+def test_yfinance_uppercase_shares_symbol_accepts_lowercase_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        [_raw_shares_payload(symbol="SPY")],
+    )
+
+    result = download_shares_history(
+        ["spy"],
+        start="2024-01-01",
+        end="2024-02-01",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.successful_tickers == ("spy",)
+    assert result.shares["ticker"].unique().tolist() == ["spy"]
+
+
+def test_partial_shares_identity_mismatch_does_not_contaminate_valid_ticker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        [
+            _raw_shares_payload(symbol="SPY"),
+            _raw_shares_payload(symbol="SPY"),
+        ],
+    )
+
+    result = download_shares_history(
+        ["SPY", "QQQ"],
+        start="2024-01-01",
+        end="2024-02-01",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.successful_tickers == ("SPY",)
+    assert result.failed_tickers == ("QQQ",)
+    assert result.shares["ticker"].unique().tolist() == ["SPY"]
+    assert not result.shares["ticker"].eq("QQQ").any()
 
 
 def test_raw_explicit_zero_is_rejected_not_converted_to_missing(

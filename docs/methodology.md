@@ -67,6 +67,12 @@ remains available as a deterministic caller override, not as the normal
 concurrent live-ingestion policy. Provider upgrades require renewed source
 review and offline tests before the exact pin changes.
 
+The raw chart result supplies provider identity as the scalar
+`chart.result[0].meta.symbol`. The adapter validates that identifier against the
+uppercase requested-symbol convention in yfinance 1.5.2 before assigning the
+requested ticker to any values. Missing, malformed, or conflicting identity is
+a failed ticker response. No heuristic alias mapping is applied.
+
 ### Canonical fields and units
 
 The processed dataset contains at most one row per `ticker` and `date` with
@@ -121,6 +127,13 @@ PyArrow decimal are currently unsupported. Boolean, complex, string, object,
 datetime, timedelta, categorical, sparse, decimal, and other unsupported dtypes
 are invalid before Parquet serialization. Values are not inspected or coerced
 to rescue an unsupported dtype.
+Raw integers, floats, and nulls are first materialized per field without lossy
+DataFrame or NumPy inference. A mixed representation is accepted only if every
+value and missing state has an exact common numeric representation. The
+normalized price contract remains `float64`, so every source value must also
+round-trip exactly through `float64`; an inexact integer above `2**53` is
+rejected before canonical assignment rather than rounded. Explicit zero remains
+distinct from missing.
 Individual missing market fields are preserved; observations are never
 forward-filled, backfilled, or invented. Every ticker/date row must contain at
 least one of `open`, `high`, `low`, `close`, `adjusted_close`, or `volume`. A row
@@ -177,6 +190,19 @@ partial; existing history for failed, empty, or otherwise unrequested tickers is
 not deleted. An entirely empty or failed batch cannot replace an existing
 canonical file.
 
+The production updater carries the same batch's structured ticker outcomes into
+persistence: status, inclusive-start/exclusive-end price request bounds, exact
+returned dates, row count, and retrieval timestamp. Those fields must match the
+incoming canonical rows exactly. While holding the output transaction lock and
+after loading the current canonical file, persistence compares only existing
+ticker/date keys inside each successful ticker's confirmed request window with
+that response's returned dates. If any such existing key is absent, the update
+is rejected for manual review, all affected keys are reported deterministically,
+the canonical bytes remain unchanged, and no revision snapshot is created. The
+row is not auto-deleted. Existing dates outside coverage and all history for
+failed, empty, or unrequested tickers remain preserved. The check never invents
+weekend, holiday, or arbitrary calendar observations.
+
 ## Historical shares outstanding
 
 ### Source and verified interface
@@ -197,6 +223,12 @@ fundamentals-timeseries request and parser while calling the yfinance-owned
 uncached `Ticker._data.get` transport. This keeps yfinance responsible for its
 session, authentication, cookie/crumb, configured retries, HTTP behavior, and
 rate-limit errors. No independent project HTTP client or retry loop is used.
+
+The fundamentals-timeseries result supplies identity in the single-symbol
+collection at `timeseries.result[0].meta.symbol`. The raw parser validates that
+identifier against yfinance 1.5.2's uppercase requested-symbol convention before
+assigning the requested ticker. Missing, malformed, or conflicting identity
+metadata fails the ticker response; no alias heuristic is used.
 
 Tests use injected Series and raw payload fixtures only. No live Yahoo request
 was made while implementing or testing Day 3, so actual ETF coverage,
@@ -270,6 +302,13 @@ duplicate ticker/date observations with the same shares value retain the row
 with the latest retrieval timestamp deterministically; conflicting duplicate
 values are invalid.
 
+Raw Python integers and floats are materialized separately before the shared
+lossless numeric harmonization policy combines them. This prevents pandas
+constructor inference from converting a large integer through an inexact
+binary float. Integer/null inputs retain the exact integer and missing state;
+mixed values are accepted only when exact round-trips prove that one supported
+representation preserves every input.
+
 ### Source vintages and persistence
 
 The canonical file represents the latest successfully validated shares source
@@ -298,6 +337,12 @@ An adjacent cross-process lock scoped to each output path serializes the entire
 existing-file read, validation, merge, snapshot, and atomic replacement
 transaction. Lock acquisition fails clearly after 30 seconds. Custom outputs
 use independent locks.
+
+No price-style disappearance rule is applied to shares. Shares observations are
+intentionally sparse, and the inspected yfinance 1.5.2 implementation does not
+establish exact fundamentals-timeseries response inclusivity. A missing sparse
+date therefore is not sufficient evidence that a previously stored shares
+observation vanished inside confirmed coverage.
 
 Shares outstanding are the provider's count of ETF shares represented by this
 source. They are not trading volume, assets under management, NAV, fund flow, or

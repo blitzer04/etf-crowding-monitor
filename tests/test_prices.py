@@ -61,9 +61,10 @@ def _single_ticker_frame(
 def _raw_chart_payload(
     *,
     dates: tuple[str, ...] = ("2024-01-02", "2024-01-03"),
-    quote_values: dict[str, list[float | None]] | None = None,
-    adjusted_close_values: list[float | None] | None = None,
+    quote_values: dict[str, list[object]] | None = None,
+    adjusted_close_values: list[object] | None = None,
     include_adjusted_close: bool = True,
+    symbol: object = "SPY",
 ) -> dict[str, object]:
     row_count = len(dates)
     resolved_quote_values = quote_values or {
@@ -74,7 +75,10 @@ def _raw_chart_payload(
         "volume": [1_000_000.0, 1_200_000.0][:row_count],
     }
     result: dict[str, object] = {
-        "meta": {"exchangeTimezoneName": "America/New_York"},
+        "meta": {
+            "symbol": symbol,
+            "exchangeTimezoneName": "America/New_York",
+        },
         "timestamp": [
             int(pd.Timestamp(value, tz="America/New_York").timestamp())
             for value in dates
@@ -348,6 +352,35 @@ def test_price_download_batch_uses_one_stable_dense_numeric_representation() -> 
     assert all(
         str(result.prices[column].dtype) == "float64" for column in PRICE_VALUE_COLUMNS
     )
+
+
+def test_price_batch_concat_preserves_exact_large_float64_integer() -> None:
+    exactly_representable_integer = 2**53
+
+    def mixed_numeric_download(ticker: str, start: date, end: date) -> pd.DataFrame:
+        del start, end
+        provider_data = _single_ticker_frame(
+            index=pd.DatetimeIndex(["2024-01-02"], name="Date")
+        )
+        if ticker == "SPY":
+            provider_data["Volume"] = pd.Series(
+                [exactly_representable_integer],
+                index=provider_data.index,
+                dtype="Int64",
+            )
+        return provider_data
+
+    result = download_price_history(
+        ["SPY", "QQQ"],
+        start="2024-01-01",
+        end="2024-01-04",
+        downloader=mixed_numeric_download,
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    spy_volume = result.prices.loc[result.prices["ticker"].eq("SPY"), "volume"].iloc[0]
+    assert spy_volume == exactly_representable_integer
+    assert int(spy_volume) == exactly_representable_integer
 
 
 def test_single_ticker_multiindex_output_is_supported() -> None:
@@ -795,6 +828,9 @@ def test_observation_exactly_on_inclusive_start_is_accepted() -> None:
 
     assert result.successful_tickers == ("SPY",)
     assert result.prices["date"].tolist() == [pd.Timestamp("2024-01-02")]
+    assert result.statuses[0].query_start == date(2024, 1, 2)
+    assert result.statuses[0].query_end == date(2024, 1, 4)
+    assert result.statuses[0].returned_dates == (date(2024, 1, 2),)
 
 
 @pytest.mark.parametrize(
@@ -1199,6 +1235,228 @@ def test_raw_chart_fixture_produces_real_numeric_market_dtypes() -> None:
     )
 
 
+def test_raw_chart_preserves_large_integer_before_canonical_float_cast() -> None:
+    large_integer = 9_007_199_254_740_993
+    payload = _raw_chart_payload(
+        dates=("2024-01-02",),
+        quote_values={
+            "open": [100],
+            "high": [103],
+            "low": [99],
+            "close": [102],
+            "volume": [large_integer],
+        },
+        adjusted_close_values=[101.5],
+    )
+
+    provider_data = price_module._raw_chart_to_provider_frame(payload, "SPY")
+
+    assert provider_data["Volume"].iloc[0] == large_integer
+    assert int(provider_data["Volume"].iloc[0]) == large_integer
+
+
+def test_raw_chart_uint64_buffer_preserves_each_original_python_integer() -> None:
+    raw_volumes = [2**53 + 1, 2**63]
+    payload = _raw_chart_payload(
+        quote_values={
+            "open": [100, 102],
+            "high": [103, 105],
+            "low": [99, 101],
+            "close": [102, 104],
+            "volume": raw_volumes,
+        },
+    )
+
+    provider_data = price_module._raw_chart_to_provider_frame(payload, "SPY")
+
+    assert str(provider_data["Volume"].dtype) == "UInt64"
+    assert provider_data["Volume"].tolist() == raw_volumes
+
+
+def test_large_inexact_volume_is_rejected_before_canonical_corruption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    large_integer = 9_007_199_254_740_993
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        _raw_chart_payload(
+            dates=("2024-01-02",),
+            quote_values={
+                "open": [100],
+                "high": [103],
+                "low": [99],
+                "close": [102],
+                "volume": [large_integer],
+            },
+            adjusted_close_values=[101.5],
+        ),
+    )
+
+    result = download_price_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-01-04",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.failed_tickers == ("SPY",)
+    assert result.prices.empty
+    assert "cannot be represented losslessly as canonical float64" in (
+        result.statuses[0].error or ""
+    )
+
+
+def test_exactly_representable_mixed_raw_values_remain_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        _raw_chart_payload(
+            quote_values={
+                "open": [100, 102.5],
+                "high": [103, 105.5],
+                "low": [99, 101.5],
+                "close": [102, 104.5],
+                "volume": [1_000_000, 1_200_000.0],
+            },
+        ),
+    )
+
+    result = download_price_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-01-04",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.successful_tickers == ("SPY",)
+    assert result.prices["open"].tolist() == [100.0, 102.5]
+    assert result.prices["volume"].tolist() == [1_000_000.0, 1_200_000.0]
+
+
+def test_raw_mixed_values_without_lossless_representation_are_rejected() -> None:
+    payload = _raw_chart_payload(
+        quote_values={
+            "open": [9_007_199_254_740_993, 100.5],
+            "high": [9_007_199_254_740_995, 103.5],
+            "low": [9_007_199_254_740_991, 99.5],
+            "close": [9_007_199_254_740_993, 102.5],
+            "volume": [1_000_000, 1_200_000],
+        },
+    )
+
+    with pytest.raises(
+        PriceNormalizationError,
+        match="cannot be represented losslessly",
+    ):
+        price_module._raw_chart_to_provider_frame(payload, "SPY")
+
+
+def test_matching_chart_metadata_symbol_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_raw_yfinance_ticker(monkeypatch, _raw_chart_payload(symbol="SPY"))
+
+    result = download_price_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-01-04",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.successful_tickers == ("SPY",)
+
+
+def test_mismatched_chart_metadata_symbol_never_reaches_canonical_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_raw_yfinance_ticker(monkeypatch, _raw_chart_payload(symbol="QQQ"))
+
+    result = download_price_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-01-04",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.failed_tickers == ("SPY",)
+    assert result.prices.empty
+    assert "identifies symbol 'QQQ', not requested symbol 'SPY'" in (
+        result.statuses[0].error or ""
+    )
+
+
+@pytest.mark.parametrize("symbol", [None, 123, True, "", " SPY "])
+def test_missing_or_malformed_chart_metadata_symbol_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    symbol: object,
+) -> None:
+    payload = _raw_chart_payload(symbol=symbol)
+    if symbol is None:
+        result_payload = payload["chart"]
+        assert isinstance(result_payload, dict)
+        results = result_payload["result"]
+        assert isinstance(results, list)
+        result = results[0]
+        assert isinstance(result, dict)
+        metadata = result["meta"]
+        assert isinstance(metadata, dict)
+        del metadata["symbol"]
+    _install_raw_yfinance_ticker(monkeypatch, payload)
+
+    result = download_price_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-01-04",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.failed_tickers == ("SPY",)
+    assert result.prices.empty
+    assert "valid 'symbol' identifier" in (result.statuses[0].error or "")
+
+
+def test_yfinance_uppercase_symbol_contract_accepts_lowercase_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_raw_yfinance_ticker(monkeypatch, _raw_chart_payload(symbol="SPY"))
+
+    result = download_price_history(
+        ["spy"],
+        start="2024-01-01",
+        end="2024-01-04",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.successful_tickers == ("spy",)
+    assert result.prices["ticker"].unique().tolist() == ["spy"]
+
+
+def test_partial_batch_identity_mismatch_does_not_contaminate_valid_ticker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_raw_yfinance_ticker(
+        monkeypatch,
+        _raw_chart_payload(symbol="SPY"),
+        payload_sequence=[
+            _raw_chart_payload(symbol="SPY"),
+            _raw_chart_payload(symbol="SPY"),
+        ],
+    )
+
+    result = download_price_history(
+        ["SPY", "QQQ"],
+        start="2024-01-01",
+        end="2024-01-04",
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert result.successful_tickers == ("SPY",)
+    assert result.failed_tickers == ("QQQ",)
+    assert result.prices["ticker"].unique().tolist() == ["SPY"]
+    assert not result.prices["ticker"].eq("QQQ").any()
+
+
 def test_yfinance_exception_config_is_restored_after_provider_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1237,7 +1495,10 @@ def test_genuine_empty_yfinance_history_remains_empty_status(
             "chart": {
                 "result": [
                     {
-                        "meta": {"exchangeTimezoneName": "America/New_York"},
+                        "meta": {
+                            "symbol": "SPY",
+                            "exchangeTimezoneName": "America/New_York",
+                        },
                         "indicators": {"quote": [{}]},
                     }
                 ],
