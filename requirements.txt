@@ -1,5 +1,6 @@
 # Production dependencies (kept in sync with pyproject.toml)
-numpy>=1.26
+exchange-calendars==4.13.2
+numpy>=1.26.4
 pandas>=2.2
 plotly>=5.20
 pyarrow>=15.0

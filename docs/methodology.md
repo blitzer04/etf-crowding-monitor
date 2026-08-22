@@ -3,11 +3,11 @@
 ## Scope and status
 
 This document describes the implemented price and shares-outstanding data
-foundations and intended research design for the U.S. ETF Crowding & Overheating
-Risk Monitor. No flow proxy, empirical factor calculations, scores, thresholds,
-backtests, or conclusions exist at this stage. Exact definitions, units,
-transformations, date alignment, and missing-data rules will be specified and
-tested before any factor is presented as a result.
+foundations, the implemented Momentum calculation, and the intended research
+design for the U.S. ETF Crowding & Overheating Risk Monitor. No flow proxy,
+composite score, thresholds, backtests, or empirical conclusions exist at this
+stage. Momentum is a standalone diagnostic component and is not a Crowding
+Score.
 
 Flow is deferred from both historical and current scores because the current
 shares source did not pass the approved event-time acceptance specification.
@@ -359,7 +359,7 @@ proxy. A later methodology may estimate such a proxy from changes in shares,
 but must define the formula, units, timing, sparse-date alignment, and
 limitations separately.
 
-## Planned live factors
+## Factor methodology and status
 
 ### 1. Flow
 
@@ -484,12 +484,126 @@ issuer-page observations, or automatically redistributed component weights.
 
 ### 2. Momentum
 
-The momentum factor is intended to describe the strength or persistence of
-recent price performance. Total-return calculations will use adjusted prices
-when appropriate. Any use of source OHLC instead will require an explicit reason
-and must account for the provider semantics described above. The lookback
-horizon, return definition, minimum-history requirement, and date alignment have
-not yet been selected.
+Momentum is implemented as a standalone, per-ETF price-trend diagnostic. It
+measures positive trailing total-return pressure; it does not measure investor
+positioning, ownership concentration, or creation/redemption activity. Momentum
+alone is not a Crowding Score and does not define a composite.
+
+#### Reference calendar and alignment
+
+Version-pinned `exchange-calendars==4.13.2` supplies the common `XNYS`
+regular-session calendar for the configured U.S. ETF universe. XNYS session
+labels are timezone-naive local market dates and align directly with canonical
+price dates. Regular holidays and full special closures are not sessions. An
+early-close day remains one session and receives no duration adjustment.
+
+Calendar reindexing is validation and alignment only. It must not create,
+modify, fill, or persist a price value. Any canonical price date inside the
+Momentum calculation scope that is not an XNYS session is a validation error;
+it is never silently dropped or remapped.
+
+`exchange-calendars` is a versioned methodology dependency because corrected or
+newly recorded closures can change session positions. Before approving any
+future version, compare the complete old and candidate XNYS session-label sets
+from `2018-01-01` through the evaluation end and review every added or removed
+session. Do not allow an automatic dependency upgrade to change the calendar.
+
+#### Raw return and endpoint eligibility
+
+For an XNYS signal session `d_t`, let `d_{t-252}` be the session exactly 252
+XNYS positions earlier. With finite, positive canonical adjusted closes `A_t`
+and `A_{t-252}`, define the dimensionless raw Momentum observation:
+
+```text
+R_t = log(A_t / A_{t-252})
+```
+
+The optional display return, expressed in percentage points, is:
+
+```text
+simple_return_pct_t = 100 * (A_t / A_{t-252} - 1)
+```
+
+The implementation evaluates these unchanged formulas without first forcing an
+exact integer endpoint difference through a rounded endpoint ratio. It uses a
+cancellation-safe relative-change calculation where representable and a
+log-domain fallback for extreme valid endpoints. If a mathematically valid
+positive display return exceeds finite Float64 range, the primary raw log return
+remains eligible and usable, `simple_return_pct` remains missing, and
+`simple_return_status` is `exceeds_float64_range`. Ordinary representable display
+returns use status `available`; endpoint-ineligible rows use
+`endpoint_ineligible`.
+
+There is one absolute 252-session horizon and no recent-session skip. The
+normalized input is the log return, not the display percentage. Only canonical
+`adjusted_close` is used. The calculation never substitutes `close`, shifts an
+endpoint, carries an earlier value, interpolates, backfills, or reinterprets the
+horizon as the 252nd nonmissing price.
+
+If either exact endpoint row or endpoint `adjusted_close` is missing, `R_t`, the
+display return, and normalized Momentum are `NaN`. A missing interior canonical
+row or interior adjusted price does not shift the endpoints and does not by
+itself invalidate the endpoint holding-period return because it is not an input
+to the formula. The implementation preserves the counts and exact XNYS dates of
+interior missing rows and present rows with missing `adjusted_close` as separate
+diagnostics.
+
+#### Signal timing
+
+The observation is labeled as of the close of `d_t`. Its first prospective-use
+date is the next XNYS session. This prevents same-session prospective use but
+does not make the historical series point-in-time backtestable: canonical
+prices and their adjusted-close history represent the currently retrieved
+source vintage rather than a reconstruction of what the provider had published
+on each historical date.
+
+#### Per-ETF normalization
+
+Normalize each ETF independently. The trailing 756-XNYS-session window as of
+`d_t` is inclusive of `d_t`, but the current raw observation is excluded from
+its reference population. Eligible prior raw observations may therefore be
+dated only from `d_{t-755}` through `d_{t-1}`. Let their count be `N`; require
+`N >= 252`.
+
+For current raw observation `R_t`, use the exact midrank empirical percentile:
+
+```text
+P_t = (count(R_j < R_t) + 0.5 * count(R_j = R_t)) / N
+Momentum_t = 100 * P_t
+```
+
+The output range is 0 to 100. A current value tied with a zero-variance
+reference population receives 50. Higher Momentum means stronger positive
+price pressure and therefore a stronger one-sided overheating indication.
+Negative returns are not converted to absolute values or a two-sided extremeness
+measure.
+
+An invalid current return or fewer than 252 eligible prior observations
+produces `NaN`. The calculation applies no winsorization or clipping and does
+not substitute zero, neutrality, a stale observation, or redistributed
+component weights.
+
+With complete adjusted-close endpoints from the beginning of price history,
+the first raw observation is on the 253rd XNYS session, the first normalized
+observation is on the 505th session, and its first prospective-use date is the
+506th session. Missing endpoints can delay eligibility.
+
+#### Derived output and persistence
+
+`calculate_momentum` returns an in-memory DataFrame sorted by ticker and signal
+date. Its narrow audit contract contains:
+
+- ticker, signal date, exact endpoint dates, and exact endpoint adjusted closes;
+- raw log return, optional simple-return percentage, and deterministic
+  display-return status;
+- Momentum percentile and normalization reference count;
+- first prospective-use XNYS session;
+- endpoint eligibility and a reason code;
+- counts and exact dates for interior missing rows and missing adjusted prices.
+
+The calculation does not mutate or persist canonical prices and does not
+persist its derived result. Historical values remain exploratory
+current-vintage diagnostics, not point-in-time backtest results.
 
 ### 3. Concentration
 

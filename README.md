@@ -44,13 +44,14 @@ tests or user-supplied universes.
 This is a curated present-day research universe, not a reconstruction of every
 ETF that was investable at each historical date.
 
-## Planned methodology
+## Factor methodology and status
 
-The monitor's future research design considers four interpretable factors:
+The monitor's research design considers four interpretable factors:
 
 1. **Flow:** a creation/redemption flow proxy when derived from changes in
    shares outstanding, clearly distinguished from reported fund flows.
-2. **Momentum:** price-trend measures based on appropriately adjusted prices.
+2. **Momentum:** an implemented XNYS-aligned, per-ETF percentile of trailing
+   252-session adjusted-price log returns.
 3. **Concentration:** a current holdings-based measure of how strongly an ETF is
    exposed to a small number of constituents.
 4. **Volatility:** measures of the magnitude and change in price variability.
@@ -70,12 +71,12 @@ look-ahead bias. Definitions, alignment rules, and limitations are documented in
 decision is recorded separately in
 [`docs/flow-data-source-feasibility.md`](docs/flow-data-source-feasibility.md).
 
-Historical daily price ingestion/persistence and historical shares-outstanding
-ingestion/persistence are implemented. This describes pipeline and raw-data
-contract availability, not empirical suitability of the current shares source
-for Flow scoring. The creation/redemption flow proxy, Day 4 signal construction,
-factor definitions, composite scores, backtests, application work, and empirical
-conclusions are not implemented.
+Historical daily price ingestion/persistence, historical shares-outstanding
+ingestion/persistence, and the standalone Momentum component are implemented.
+This describes pipeline and calculation availability, not empirical suitability
+of the current shares source for Flow scoring. The creation/redemption flow
+proxy, remaining factor definitions, composite scores, backtests, application
+work, and empirical conclusions are not implemented.
 
 ## Planned project architecture
 
@@ -389,10 +390,44 @@ contract and is documented in
 The adapter and its offline contract tests remain pinned to yfinance 1.5.2 and
 require renewed inspection on a provider upgrade.
 
+## Momentum component
+
+`etf_crowding.signals.calculate_momentum` calculates the approved standalone
+Momentum percentile entirely in memory from canonical prices. It uses the
+version-pinned `exchange-calendars==4.13.2` XNYS regular-session calendar, exact
+`adjusted_close` endpoints 252 sessions apart, and eligible prior raw returns
+from `d_{t-755}` through `d_{t-1}`. At least 252 prior observations are required,
+and ties use the midrank empirical percentile.
+
+Return arithmetic preserves exact integer endpoint differences before floating
+conversion and uses a log-domain fallback for extreme valid endpoint ratios. If
+the optional positive display percentage exceeds finite Float64 range, the raw
+log return remains eligible while `simple_return_pct` remains missing and
+`simple_return_status` reports `exceeds_float64_range`.
+
+Missing endpoint rows or adjusted prices remain `NaN`; `close` is never used as
+a fallback. Interior missingness is reported without shifting the endpoints.
+The output records endpoint values, raw and display returns, display-return
+status, reference count, first prospective-use session, endpoint status, and
+exact interior-missingness diagnostics. It is not persisted and does not modify
+canonical prices.
+
+Momentum is labeled as of the current XNYS close and is first prospectively
+usable on the next XNYS session. Its history uses the current canonical price
+vintage and is exploratory rather than a point-in-time backtest. It is not a
+Crowding Score, and it does not replace deferred Flow or define composite
+weights, thresholds, or missing-component behavior.
+
+Canonical dates inside a Momentum calculation scope must be XNYS sessions.
+Before any future `exchange-calendars` upgrade is approved, the complete XNYS
+session-label set from `2018-01-01` through the evaluation end must be compared
+with the pinned version and every difference reviewed.
+
 ## Technology stack
 
 - Python 3.12
 - pandas, NumPy, SciPy, and statsmodels for data and statistical work
+- exchange-calendars 4.13.2 for the pinned XNYS reference-session calendar
 - yfinance 1.5.2 as the pinned historical price and shares-data interface
 - PyYAML and PyArrow for configuration and data storage
 - Plotly and Streamlit for the planned public application
@@ -401,15 +436,16 @@ require renewed inspection on a provider upgrade.
 ## Current development status
 
 Day 1 established the repository foundation and canonical ETF universe. Day 2
-implements historical daily price ingestion. Day 3 implements the historical
+implements historical daily price ingestion. Day 3 implements historical
 shares-outstanding ingestion, validation, incremental Parquet persistence, and
-command-line update workflow. The 2026-08-21 source audit found the observed
-Yahoo/yfinance shares history unsuitable for the approved Flow methodology, so
-Flow is deferred from both historical and current scores. Pipeline implementation
-must not be confused with source suitability. The creation/redemption flow proxy,
-Day 4 signal construction, holdings, concentration, momentum, volatility,
-composite scores, backtests, analysis case studies, and Streamlit pages are not
-yet implemented.
+the command-line update workflow. Day 4 finalized the future Flow methodology,
+audited source feasibility, and deferred Flow because no production-eligible
+source exists. A subsequent phase implemented the standalone Momentum component
+and its audit diagnostics.
+Pipeline implementation must not be confused with source suitability. The
+creation/redemption flow proxy, holdings, concentration, volatility, composite
+scores, backtests, analysis case studies, and Streamlit pages are not yet
+implemented.
 
 ## Data limitations
 
