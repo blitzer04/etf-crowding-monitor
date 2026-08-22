@@ -54,7 +54,8 @@ The monitor's research design considers four interpretable factors:
    252-session adjusted-price log returns.
 3. **Concentration:** a current holdings-based measure of how strongly an ETF is
    exposed to a small number of constituents.
-4. **Volatility:** measures of the magnitude and change in price variability.
+4. **Volatility:** an approved future per-ETF percentile of 21-session
+   annualized adjusted-price return dispersion; it is not implemented.
 
 Flow is deferred from both historical and current scores until a data source
 passes the unchanged event-time acceptance specification. It will not be
@@ -75,7 +76,7 @@ Historical daily price ingestion/persistence, historical shares-outstanding
 ingestion/persistence, and the standalone Momentum component are implemented.
 This describes pipeline and calculation availability, not empirical suitability
 of the current shares source for Flow scoring. The creation/redemption flow
-proxy, remaining factor definitions, composite scores, backtests, application
+proxy, remaining factor calculations, composite scores, backtests, application
 work, and empirical conclusions are not implemented.
 
 ## Planned project architecture

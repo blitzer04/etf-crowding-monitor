@@ -620,9 +620,212 @@ availability dates can be audited.
 
 ### 4. Volatility
 
-The volatility factor is intended to measure the magnitude or change in ETF
-price variability. The return frequency, estimator, lookback window, annualizing
-convention, minimum observations, and missing-data rules remain to be defined.
+The following is the approved future Volatility methodology. It is not
+implemented. Volatility is a standalone diagnostic of whether an ETF's recent
+price variability is unusually high relative to that ETF's own history. It does
+not establish crowding, positioning, creation activity, expected returns, crash
+probability, or an imminent reversal. It is not a Crowding Score.
+
+#### Reference calendar and alignment
+
+Use the already pinned `exchange-calendars==4.13.2` `XNYS` regular-session
+calendar. Let `d_t` be the exact XNYS signal session. An early-close session
+counts once and receives no duration adjustment; full closures and holidays are
+not sessions.
+
+Any canonical price date inside the Volatility calculation scope that is not an
+XNYS session must be rejected rather than silently removed or remapped. Calendar
+reindexing is validation and alignment only. It must not create, fill, modify,
+or persist prices.
+
+Retain the controlled calendar-upgrade policy established for Momentum. Before
+approving any future `exchange-calendars` version, compare the complete old and
+candidate XNYS session-label sets from `2018-01-01` through the evaluation end
+and review every added or removed session.
+
+#### Daily return and stable arithmetic
+
+Use canonical `adjusted_close` exclusively. For adjacent exact XNYS sessions,
+define the dimensionless daily log return:
+
+```text
+r_e,t = log(A_e,t / A_e,t-1)
+```
+
+The calculation must not substitute `close`, skip a missing session, use the
+previous available observation, interpolate, forward-fill, backfill, or
+reinterpret the return as being between adjacent nonmissing prices. The future
+implementation must use numerically stable log-return arithmetic consistent
+with the exact-domain protections required by Momentum.
+
+#### Raw 21-session Volatility
+
+Use exactly 21 adjacent daily log returns:
+
+```text
+r_e,t-20, ..., r_e,t
+```
+
+Those returns require the complete 22-price chain:
+
+```text
+A_e,t-21, ..., A_e,t
+```
+
+Define:
+
+```text
+mean_return_e,t =
+    sum(r_e,j) / 21
+
+raw_volatility_e,t =
+    sqrt(252) *
+    sqrt(
+        sum((r_e,j - mean_return_e,t)^2) / (21 - 1)
+    )
+```
+
+Use sample dispersion with `ddof=1`, so the denominator is 20. The raw result
+is an annualized decimal. For display only, use:
+
+```text
+annualized_volatility_pct_e,t = 100 * raw_volatility_e,t
+```
+
+Use a fixed 252-session annualization convention. Do not adjust annualization
+for the actual number of XNYS sessions in an individual calendar year or for
+early-close duration. A sequence of identical daily returns has valid raw
+Volatility equal to zero. This measures return dispersion and intentionally
+differs from Momentum's directional price movement.
+
+#### Eligibility and missingness
+
+A raw observation is eligible only when all 22 exact XNYS price positions from
+`d_t-21` through `d_t` have canonical rows with finite, positive
+`adjusted_close`. Any missing canonical row or missing `adjusted_close` anywhere
+in that required chain makes current raw Volatility `NaN`.
+
+This differs intentionally from Momentum: every price in the Volatility chain
+is an endpoint of at least one required adjacent-session return. Interior
+missingness therefore invalidates the Volatility window instead of remaining
+diagnostic-only.
+
+The future derived output must retain deterministic diagnostics identifying:
+
+- the missing canonical-row count and exact dates;
+- the present-row/missing-`adjusted_close` count and exact dates;
+- window eligibility and a deterministic reason code.
+
+Do not permit partial windows, reduced minimum-period calculations, filling,
+endpoint movement, or stale substitution.
+
+#### Signal timing and freshness
+
+Label Volatility as of the close of `d_t`. The value is observable only after
+that close and must not be used prospectively at the same closing price. Its
+first prospective-use date is the next XNYS regular session.
+
+A current result requires an eligible observation on the declared target
+session. An older value may be shown only as a separately labeled stale
+diagnostic and must not replace current Volatility. `retrieved_at` may be
+disclosed but is not an authoritative historical publication timestamp.
+
+#### Per-ETF normalization
+
+Normalize each ETF separately. For eligible current raw Volatility `V_e,t`, use
+eligible prior raw Volatility observations whose signal dates are within the
+trailing 756 XNYS sessions inclusive of `d_t`. The reference population is
+limited exactly to:
+
+```text
+d_t-755 through d_t-1
+```
+
+Exclude the current raw observation and require at least 252 eligible prior
+observations. Not every date in the 756-session window must contain an eligible
+observation.
+
+With reference-population size `N`, use the exact midrank empirical percentile:
+
+```text
+P_e,t = (
+    count(V_e,j < V_e,t)
+    + 0.5 * count(V_e,j = V_e,t)
+) / N
+
+Volatility_e,t = 100 * P_e,t
+```
+
+The output range is `[0, 100]`. Exact ties receive their midrank. If every
+reference value equals the current value, Volatility is 50. If a zero-variance
+reference population lies entirely below the current value, Volatility is 100;
+if it lies entirely above the current value, Volatility is 0. Raw zero
+Volatility is valid and is not replaced with missing or neutrality. Do not use
+a z-score or standard-deviation normalization.
+
+#### Risk direction and outlier policy
+
+Volatility is one-sided. A higher percentile means unusually high current
+return dispersion and higher instability or stress risk. Positive and negative
+daily deviations contribute symmetrically to raw volatility. Low volatility is
+not automatically transformed into high risk under a complacency theory.
+
+Apply no winsorization or clipping. Preserve extreme valid results and their
+inputs. Suspected provider anomalies require a separately approved data-quality
+policy. Do not copy Flow's corporate-action quarantine. Use provider-supplied
+`adjusted_close` and retain its current-vintage and provider-revision
+limitations.
+
+#### Relationship to Momentum and excluded variants
+
+Momentum measures 252-session net price direction. Volatility measures the
+dispersion of 21 adjacent daily returns around their sample mean. A constant
+positive-return sequence can have high Momentum and zero Volatility; an
+oscillating sequence can have low net Momentum and high Volatility.
+
+Do not volatility-adjust Momentum, construct a Sharpe-like metric, or combine
+the two. Evaluate their empirical correlation before any future composite
+decision.
+
+Do not add a 21/252 volatility ratio, volatility-change factor, multi-horizon
+blend, or benchmark-relative Volatility in this phase. The normalized
+21-session level already measures whether recent volatility is unusually
+elevated relative to the ETF's own history. Additional horizons would require
+separately approved lookbacks, zero-denominator behavior, normalization,
+interpretation, and weighting.
+
+#### Missing-component and composite behavior
+
+Invalid current data or insufficient normalization history produces `NaN`. Do
+not substitute zero, a neutral percentile, stale Volatility, raw `close`,
+another component, or automatically redistributed weights.
+
+Flow remains deferred. Do not define a Momentum-plus-Volatility composite,
+weights, thresholds, risk classes, or a Crowding Score. Use the name
+`Volatility percentile` or `21-session annualized Volatility`.
+
+#### Historical status and earliest eligibility
+
+Historical Volatility calculated from the current canonical adjusted-price
+vintage is exploratory current-vintage history, not a point-in-time backtest.
+Historical adjusted prices may be revised, and current `retrieved_at` values
+cannot reconstruct when each historical price vintage first became observable.
+
+Under complete adjusted-close availability, the theoretical first raw
+Volatility observation is on the 22nd XNYS reference session. The theoretical
+first normalized observation with 252 eligible prior observations is on the
+274th session, and its first prospective-use date is the 275th session.
+
+Conditional on complete history beginning on the first XNYS session of 2018,
+the corresponding theoretical calendar dates are:
+
+- first raw Volatility: `2018-02-01`;
+- first normalized Volatility: `2019-02-04`;
+- first prospective-use date: `2019-02-05`.
+
+These are theoretical calendar dates, not empirical ETF coverage results. The
+repository currently has no canonical price dataset against which to establish
+actual ETF eligibility.
 
 ## Composite score status
 
