@@ -9,6 +9,12 @@ backtests, or conclusions exist at this stage. Exact definitions, units,
 transformations, date alignment, and missing-data rules will be specified and
 tested before any factor is presented as a result.
 
+Flow is deferred from both historical and current scores because the current
+shares source did not pass the approved event-time acceptance specification.
+This is a source-feasibility decision, not a change to that future specification
+or to the implemented shares-ingestion contract. The dated empirical evidence
+is recorded in [`flow-data-source-feasibility.md`](flow-data-source-feasibility.md).
+
 The framework is intended to monitor unusual combinations of risk indicators.
 It is not intended to predict crashes or provide a trading signal.
 
@@ -231,11 +237,13 @@ assigning the requested ticker. Missing, malformed, or conflicting identity
 metadata fails the ticker response; no alias heuristic is used.
 
 Tests use injected Series and raw payload fixtures only. No live Yahoo request
-was made while implementing or testing Day 3, so actual ETF coverage,
-historical depth, observation cadence, revision patterns, missingness patterns,
-and current raw payload behavior remain unverified. Provider upgrades require
-source inspection and contract-test review before the yfinance pin or adapter
-changes.
+was made while implementing or testing Day 3. A separate read-only audit on
+2026-08-21 subsequently evaluated source feasibility and found the observed
+shares histories unsuitable for the approved Flow methodology across the
+configured universe. That result does not alter the raw-data contract described
+here and does not establish Yahoo's undocumented internal cause. Provider
+upgrades require source inspection and contract-test review before the yfinance
+pin or adapter changes.
 
 ### Query bounds and observation dates
 
@@ -358,8 +366,121 @@ limitations separately.
 The flow factor is intended to measure unusual ETF creation and redemption
 activity. When it is inferred from changes in shares outstanding, it will be
 called a **creation/redemption flow proxy**, not an exact or reported fund flow.
-The eventual implementation must document the proxy formula, units, observation
-timing, stale values, corporate actions, and missing-data behavior.
+The following is the approved future acceptance specification. It is not
+implemented and the project currently has no production-eligible Flow data
+source.
+
+#### Interval construction and eligibility
+
+For consecutive canonical nonmissing shares observations
+`(d_{i-1}, S_{i-1})` and `(d_i, S_i)`, with no intervening dated null:
+
+- `delta_shares_i = S_i - S_{i-1}`, measured in ETF shares.
+- `interval_share_change_i = (S_i - S_{i-1}) / S_{i-1}`, a dimensionless
+  signed interval percentage.
+- `n_i` is the number of canonical price dates in `(d_{i-1}, d_i]`.
+- `raw_flow_rate_i = log(S_i / S_{i-1}) / n_i`, a signed log-share change per
+  canonical price observation.
+
+An interval is eligible only when `1 <= n_i <= 5`. An unchanged present shares
+observation is a valid zero interval: `delta_shares_i`,
+`interval_share_change_i`, and `raw_flow_rate_i` are zero. It is neither missing
+nor a neutral-filled replacement.
+
+A dated null breaks the consecutive-observation chain. The methodology does not
+interpolate or forward-fill shares, expand shares observations to the daily
+price calendar, or bridge from a nonmissing observation before the null to one
+after it.
+
+#### Signal timing and dollar diagnostic
+
+Assign an eligible interval observation to the first canonical price date
+strictly after `d_i`. This conservative timing rule prevents same-date use of
+the ending shares observation. It does not make current-vintage history
+point-in-time backtestable because the source does not establish when each
+historical shares value first became available.
+
+The optional dollar diagnostic is `delta_shares_i * close`, using the last valid
+source `close` on or before `d_i` when it is no more than four calendar days
+old. This is quoted-currency notional, not reported fund flow or NAV flow, and
+it is not the normalized Flow input. The diagnostic uses source `close`, not
+`adjusted_close`.
+
+#### Per-ETF normalization
+
+Normalize separately for each ETF. For a current eligible raw-flow-rate
+observation `R_i`, its reference population contains only eligible prior
+raw-flow-rate observations within the trailing 756 canonical price dates as of
+the signal date. The current observation is excluded, and at least 252 eligible
+prior observations are required.
+
+With reference-population size `N`, use the midrank empirical percentile:
+
+```text
+P_i = (count(R_j < R_i) + 0.5 * count(R_j = R_i)) / N
+Flow_i = 100 * P_i
+```
+
+Higher Flow means stronger creation pressure and therefore higher overheating
+risk. Redemptions may be displayed separately as a diagnostic; Flow is not
+converted into a two-sided extremeness score.
+
+An invalid or ineligible interval, or an insufficient or invalid normalization
+reference, produces `NaN`. The methodology does not substitute zero or
+neutrality, use stale observations, or redistribute component weights. No
+winsorization is applied.
+
+#### Temporary suspected-corporate-action quarantine
+
+For every shares interval between consecutive present observations, define
+`share_ratio = S_i / S_{i-1}`. The common split-factor set is
+`{1.25, 1.5, 2, 3, 4, 5, 10}` plus the reciprocal of every factor in that set.
+A common-factor match occurs for a factor when:
+
+```text
+abs(log(share_ratio / factor)) <= log(1.05)
+```
+
+The interval is independently large when `share_ratio >= 1.5` or
+`share_ratio <= 2/3`. An interval is a suspected split or reverse-split
+candidate when it has either a common-factor match or an independently large
+share ratio.
+
+Price corroboration uses the last valid source `close` on or before each shares
+endpoint. Each close must be no more than four calendar days older than its
+corresponding shares date. When both endpoint closes qualify, define:
+
+```text
+price_ratio = end_close / start_close
+notional_ratio = share_ratio * price_ratio
+```
+
+Notional continuity occurs when
+`abs(log(notional_ratio)) <= log(1.10)`. Price continuity may label a
+price-confirmed split candidate, but missing or inconsistent price evidence
+must not clear a share-ratio candidate because the provider's historical
+`close` adjustment semantics are not authoritative for this purpose.
+
+Quarantine exactly the single shares interval crossing the suspected action.
+Exclude that interval from Flow, normalization reference populations,
+eligible-observation counts, and earliest-signal feasibility calculations.
+Preserve its raw shares values, matched factor, tolerance results, endpoint
+closes and their ages, and quarantine reason code for review. Do not infer or
+apply an adjustment, widen the quarantine to adjacent intervals, or winsorize
+the interval automatically.
+
+#### Historical scope and current status
+
+Use an explicit shares-history start of `2018-01-01`. The 548-day omitted-start
+behavior in the pinned yfinance implementation is a provider query default, not
+a methodology lookback, and is insufficient for the approved 756-price-date
+normalization window and 252-prior-observation minimum.
+
+Historical results remain exploratory current-vintage history, not a
+point-in-time backtest. Flow is deferred from both historical and current scores
+until a source passes this specification. Its absence must remain missing rather
+than being represented by zero, a neutral component, stale Yahoo data, stitched
+issuer-page observations, or automatically redistributed component weights.
 
 ### 2. Momentum
 
@@ -389,40 +510,22 @@ The volatility factor is intended to measure the magnitude or change in ETF
 price variability. The return frequency, estimator, lookback window, annualizing
 convention, minimum observations, and missing-data rules remain to be defined.
 
-## Planned score distinction
+## Composite score status
 
-The framework is expected to expose two related scores because concentration
-data have different historical availability from price and shares-outstanding
-data.
+No historical or current composite has been approved. Flow is deferred, and the
+project will not redefine the planned composite as Momentum plus Volatility or
+otherwise finalize a reduced-factor substitute. Composite inputs, weights,
+thresholds, interpretation, and naming remain undecided.
 
-### Historical Crowding Score
+Current holdings may eventually support a current concentration measurement if
+their date and source are disclosed, but this does not define a current score.
+Likewise, the availability of Momentum and Volatility alone does not justify a
+historical score. A result lacking direct positioning or flow evidence must not
+be called a Crowding Score merely because Momentum and Volatility are present.
 
-Planned inputs:
-
-```text
-Flow + Momentum + Volatility
-```
-
-This score will be calculated only from information observable at or before each
-historical calculation date. Concentration is excluded initially because the
-project does not yet have reliable point-in-time historical holdings.
-
-### Current Crowding Score
-
-Planned inputs:
-
-```text
-Flow + Momentum + Concentration + Volatility
-```
-
-This score may use current holdings for a current concentration measurement,
-provided the holdings date and source are disclosed. It will not be presented as
-directly interchangeable with a three-factor historical score unless a later
-methodology explicitly establishes comparability.
-
-Factor normalization, weighting, aggregation, and interpretation thresholds are
-not yet specified. They will require transparent definitions, hand-calculated
-unit tests, sensitivity analysis, and clear communication of missing inputs.
+Any future composite will require transparent definitions, hand-calculated unit
+tests, sensitivity analysis, point-in-time controls, and explicit missing-input
+behavior before it is presented as a result.
 
 ## Point-in-time and data-integrity principles
 
@@ -446,7 +549,11 @@ left the investable set.
 ### Incomplete historical shares-outstanding data
 
 Shares-outstanding histories may begin late, contain gaps, or reflect revisions.
-This may reduce the usable history or comparability of the planned flow proxy.
+The 2026-08-21 audit found that the observed Yahoo/yfinance histories could not
+support the approved Flow specification across the configured universe. This is
+a dated provider-feasibility result, not proof that Yahoo internally capped or
+truncated its responses. See
+[`flow-data-source-feasibility.md`](flow-data-source-feasibility.md).
 
 ### Flow proxy limitations
 
@@ -475,5 +582,6 @@ fill absent observations. Shares history may be sparse and is not expanded to
 the price calendar. Future factor methodology must define minimum coverage,
 alignment, and exclusion rules without fabricating observations.
 
-These are anticipated research constraints, not empirical findings. Their actual
-impact cannot be assessed until data ingestion and analysis are implemented.
+Most of these remain anticipated research constraints. The shares-source
+feasibility limitation was empirically observed on 2026-08-21, but no Flow
+factor, score, backtest, or broader empirical conclusion was produced.

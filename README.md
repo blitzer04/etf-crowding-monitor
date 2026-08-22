@@ -46,7 +46,7 @@ ETF that was investable at each historical date.
 
 ## Planned methodology
 
-The monitor is planned around four interpretable factors:
+The monitor's future research design considers four interpretable factors:
 
 1. **Flow:** a creation/redemption flow proxy when derived from changes in
    shares outstanding, clearly distinguished from reported fund flows.
@@ -55,17 +55,27 @@ The monitor is planned around four interpretable factors:
    exposed to a small number of constituents.
 4. **Volatility:** measures of the magnitude and change in price variability.
 
-The planned historical score will combine flow, momentum, and volatility.
-Concentration will be added only to the current score until reliable
-point-in-time holdings snapshots are available. Current holdings will not be
-applied retroactively because that would introduce look-ahead bias. Definitions,
-alignment rules, and limitations are documented in
-[`docs/methodology.md`](docs/methodology.md).
+Flow is deferred from both historical and current scores until a data source
+passes the unchanged event-time acceptance specification. It will not be
+represented by zero, a neutral component, stale Yahoo data, stitched issuer-page
+observations, or automatically redistributed weights. No historical or current
+composite has been finalized: inputs, weights, thresholds, interpretation, and
+naming remain undecided. In particular, an indicator containing Momentum and
+Volatility but no direct positioning or flow evidence will not be called a
+Crowding Score merely because those components are available.
+
+Current holdings will not be applied retroactively because that would introduce
+look-ahead bias. Definitions, alignment rules, and limitations are documented in
+[`docs/methodology.md`](docs/methodology.md). The dated evidence behind the Flow
+decision is recorded separately in
+[`docs/flow-data-source-feasibility.md`](docs/flow-data-source-feasibility.md).
 
 Historical daily price ingestion/persistence and historical shares-outstanding
-ingestion/persistence are implemented. The creation/redemption flow proxy, Day
-4 signal construction, factor weights, thresholds, composite scores, backtests,
-application work, and empirical conclusions are not implemented yet.
+ingestion/persistence are implemented. This describes pipeline and raw-data
+contract availability, not empirical suitability of the current shares source
+for Flow scoring. The creation/redemption flow proxy, Day 4 signal construction,
+factor definitions, composite scores, backtests, application work, and empirical
+conclusions are not implemented.
 
 ## Planned project architecture
 
@@ -370,11 +380,14 @@ inclusivity. The price disappearance rule is therefore not copied to shares:
 absence of a sparse shares date is not treated as proof that an observation
 vanished inside confirmed coverage.
 
-No live Yahoo request was used to establish Day 3. Actual ETF availability,
-history depth, source observation frequency, revisions, and null patterns are
-therefore unverified and may be incomplete. The adapter and its offline
-contract tests are pinned to yfinance 1.5.2 and require renewed inspection on a
-provider upgrade.
+No live Yahoo request was used to implement or test Day 3. A separate read-only
+audit on 2026-08-21 later found that the observed shares histories could not
+support the approved Flow methodology across the configured universe. That
+dated provider-feasibility result does not alter the implemented ingestion
+contract and is documented in
+[`docs/flow-data-source-feasibility.md`](docs/flow-data-source-feasibility.md).
+The adapter and its offline contract tests remain pinned to yfinance 1.5.2 and
+require renewed inspection on a provider upgrade.
 
 ## Technology stack
 
@@ -390,19 +403,23 @@ provider upgrade.
 Day 1 established the repository foundation and canonical ETF universe. Day 2
 implements historical daily price ingestion. Day 3 implements the historical
 shares-outstanding ingestion, validation, incremental Parquet persistence, and
-command-line update workflow. The creation/redemption flow proxy, Day 4 signal
-construction, holdings,
-concentration, momentum, volatility, crowding scores, backtests, analysis case
-studies, and Streamlit pages are not yet implemented.
+command-line update workflow. The 2026-08-21 source audit found the observed
+Yahoo/yfinance shares history unsuitable for the approved Flow methodology, so
+Flow is deferred from both historical and current scores. Pipeline implementation
+must not be confused with source suitability. The creation/redemption flow proxy,
+Day 4 signal construction, holdings, concentration, momentum, volatility,
+composite scores, backtests, analysis case studies, and Streamlit pages are not
+yet implemented.
 
 ## Data limitations
 
 Limitations include survivorship bias from the present-day curated universe,
 third-party price and shares-data availability and revisions, missing
-observations, unverified and potentially incomplete shares-outstanding coverage,
-the difference between a future flow proxy and reported flows, and lack of
-historical point-in-time holdings. Missing data are not silently invented or
-forward-filled. Each canonical row records a client-side retrieval time, but
+observations, the empirically unsuitable Yahoo/yfinance shares coverage observed
+on 2026-08-21, the difference between a future flow proxy and reported flows,
+and lack of historical point-in-time holdings. The audit does not establish the
+provider's undocumented internal cause. Missing data are not silently invented
+or forward-filled. Each canonical row records a client-side retrieval time, but
 Yahoo Finance does not provide an exchange-authoritative publication timestamp
 for every historical observation.
 
