@@ -3,11 +3,11 @@
 ## Scope and status
 
 This document describes the implemented price and shares-outstanding data
-foundations, the implemented Momentum calculation, and the intended research
-design for the U.S. ETF Crowding & Overheating Risk Monitor. No flow proxy,
-composite score, thresholds, backtests, or empirical conclusions exist at this
-stage. Momentum is a standalone diagnostic component and is not a Crowding
-Score.
+foundations, the implemented standalone Momentum and Volatility calculations,
+and the intended research design for the U.S. ETF Crowding & Overheating Risk
+Monitor. No flow proxy, composite score, thresholds, backtests, or empirical
+conclusions exist at this stage. Momentum and Volatility are standalone
+diagnostic components, and neither is a Crowding Score.
 
 Flow is deferred from both historical and current scores because the current
 shares source did not pass the approved event-time acceptance specification.
@@ -620,11 +620,11 @@ availability dates can be audited.
 
 ### 4. Volatility
 
-The following is the approved future Volatility methodology. It is not
-implemented. Volatility is a standalone diagnostic of whether an ETF's recent
-price variability is unusually high relative to that ETF's own history. It does
-not establish crowding, positioning, creation activity, expected returns, crash
-probability, or an imminent reversal. It is not a Crowding Score.
+Volatility is implemented as a standalone diagnostic of whether an ETF's
+recent price variability is unusually high relative to that ETF's own history.
+It does not establish crowding, positioning, creation activity, expected
+returns, crash probability, or an imminent reversal. It is not a Crowding
+Score.
 
 #### Reference calendar and alignment
 
@@ -654,9 +654,9 @@ r_e,t = log(A_e,t / A_e,t-1)
 
 The calculation must not substitute `close`, skip a missing session, use the
 previous available observation, interpolate, forward-fill, backfill, or
-reinterpret the return as being between adjacent nonmissing prices. The future
-implementation must use numerically stable log-return arithmetic consistent
-with the exact-domain protections required by Momentum.
+reinterpret the return as being between adjacent nonmissing prices. The
+implementation uses numerically stable log-return arithmetic consistent with
+the exact-domain protections required by Momentum.
 
 #### Raw 21-session Volatility
 
@@ -710,7 +710,7 @@ is an endpoint of at least one required adjacent-session return. Interior
 missingness therefore invalidates the Volatility window instead of remaining
 diagnostic-only.
 
-The future derived output must retain deterministic diagnostics identifying:
+The derived output retains deterministic diagnostics identifying:
 
 - the missing canonical-row count and exact dates;
 - the present-row/missing-`adjusted_close` count and exact dates;
@@ -803,6 +803,26 @@ another component, or automatically redistributed weights.
 Flow remains deferred. Do not define a Momentum-plus-Volatility composite,
 weights, thresholds, risk classes, or a Crowding Score. Use the name
 `Volatility percentile` or `21-session annualized Volatility`.
+
+#### Derived output and persistence
+
+`calculate_volatility` returns an in-memory DataFrame sorted by ticker and
+signal date. Its narrow audit contract contains:
+
+- ticker, signal date, exact 22-price window dates, and first prospective-use
+  XNYS session;
+- raw annualized decimal Volatility, display percentage, percentile, and
+  normalization reference count;
+- window eligibility and a deterministic reason code;
+- counts and exact dates for missing canonical rows and present rows with
+  missing `adjusted_close`.
+
+The implementation validates the output schema, nullable dtypes, unique and
+sorted keys, finite values, percentile range, diagnostic count/date agreement,
+and eligibility/status/value relationships before returning a nonempty result.
+It fails rather than repairing a contradictory derived result. The calculation
+does not mutate or persist canonical prices and does not persist its derived
+output.
 
 #### Historical status and earliest eligibility
 

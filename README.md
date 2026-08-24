@@ -54,8 +54,8 @@ The monitor's research design considers four interpretable factors:
    252-session adjusted-price log returns.
 3. **Concentration:** a current holdings-based measure of how strongly an ETF is
    exposed to a small number of constituents.
-4. **Volatility:** an approved future per-ETF percentile of 21-session
-   annualized adjusted-price return dispersion; it is not implemented.
+4. **Volatility:** an implemented XNYS-aligned, per-ETF percentile of
+   21-session annualized adjusted-price return dispersion.
 
 Flow is deferred from both historical and current scores until a data source
 passes the unchanged event-time acceptance specification. It will not be
@@ -73,11 +73,11 @@ decision is recorded separately in
 [`docs/flow-data-source-feasibility.md`](docs/flow-data-source-feasibility.md).
 
 Historical daily price ingestion/persistence, historical shares-outstanding
-ingestion/persistence, and the standalone Momentum component are implemented.
-This describes pipeline and calculation availability, not empirical suitability
-of the current shares source for Flow scoring. The creation/redemption flow
-proxy, remaining factor calculations, composite scores, backtests, application
-work, and empirical conclusions are not implemented.
+ingestion/persistence, and the standalone Momentum and Volatility components
+are implemented. This describes pipeline and calculation availability, not
+empirical suitability of the current shares source for Flow scoring. The
+creation/redemption flow proxy, Concentration, composite scores, backtests,
+application work, and empirical conclusions are not implemented.
 
 ## Planned project architecture
 
@@ -424,6 +424,30 @@ Before any future `exchange-calendars` upgrade is approved, the complete XNYS
 session-label set from `2018-01-01` through the evaluation end must be compared
 with the pinned version and every difference reviewed.
 
+## Volatility component
+
+`etf_crowding.signals.calculate_volatility` calculates the approved standalone
+Volatility percentile entirely in memory from canonical prices. It uses exactly
+21 adjacent-XNYS adjusted-close log returns, requiring the complete 22-price
+chain ending on the signal date. Raw Volatility is their annualized sample
+standard deviation with `ddof=1` and fixed `sqrt(252)` annualization; the
+optional display value is expressed in percentage points.
+
+Any missing canonical row or missing `adjusted_close` in the chain invalidates
+the current raw result. The output records exact window dates, raw and display
+Volatility, percentile, reference count, first prospective-use session, window
+status, and exact missing-row and missing-adjusted-close diagnostics. Its
+derived contract is validated before return. The calculation does not fill,
+shift, mutate, or persist canonical prices and does not persist derived output.
+
+Normalization is per ETF, uses eligible prior observations from `d_{t-755}`
+through `d_{t-1}`, excludes the current observation, requires at least 252
+eligible prior values, and uses the midrank empirical percentile. Volatility is
+labeled as of the current XNYS close and is first prospectively usable on the
+next XNYS session. Its history uses the current adjusted-price vintage and is
+exploratory rather than a point-in-time backtest. It is not a Crowding Score and
+does not replace deferred Flow or define a composite, weights, or thresholds.
+
 ## Technology stack
 
 - Python 3.12
@@ -441,12 +465,11 @@ implements historical daily price ingestion. Day 3 implements historical
 shares-outstanding ingestion, validation, incremental Parquet persistence, and
 the command-line update workflow. Day 4 finalized the future Flow methodology,
 audited source feasibility, and deferred Flow because no production-eligible
-source exists. A subsequent phase implemented the standalone Momentum component
-and its audit diagnostics.
+source exists. Subsequent phases implemented the standalone Momentum and
+Volatility components and their audit diagnostics.
 Pipeline implementation must not be confused with source suitability. The
-creation/redemption flow proxy, holdings, concentration, volatility, composite
-scores, backtests, analysis case studies, and Streamlit pages are not yet
-implemented.
+creation/redemption flow proxy, holdings, concentration, composite scores,
+backtests, analysis case studies, and Streamlit pages are not yet implemented.
 
 ## Data limitations
 
