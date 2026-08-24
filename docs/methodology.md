@@ -5,15 +5,23 @@
 This document describes the implemented price and shares-outstanding data
 foundations, the implemented standalone Momentum and Volatility calculations,
 and the intended research design for the U.S. ETF Crowding & Overheating Risk
-Monitor. No flow proxy, composite score, thresholds, backtests, or empirical
-conclusions exist at this stage. Momentum and Volatility are standalone
-diagnostic components, and neither is a Crowding Score.
+Monitor. No Flow or Concentration component, composite score, thresholds,
+backtests, or empirical conclusions exist at this stage. Momentum and
+Volatility are standalone diagnostic components, and neither is a Crowding
+Score.
 
 Flow is deferred from both historical and current scores because the current
 shares source did not pass the approved event-time acceptance specification.
 This is a source-feasibility decision, not a change to that future specification
 or to the implemented shares-ingestion contract. The dated empirical evidence
 is recorded in [`flow-data-source-feasibility.md`](flow-data-source-feasibility.md).
+
+Concentration is deferred pending a production-eligible holdings and
+economic-entity-mapping architecture. Day 7 established the future methodology
+and reviewed official-source feasibility; it did not implement holdings
+ingestion, a Concentration calculation, normalization, or application behavior.
+The evidence and unresolved source requirements are recorded in
+[`concentration-data-source-feasibility.md`](concentration-data-source-feasibility.md).
 
 The framework is intended to monitor unusual combinations of risk indicators.
 It is not intended to predict crashes or provide a trading signal.
@@ -607,16 +615,132 @@ current-vintage diagnostics, not point-in-time backtest results.
 
 ### 3. Concentration
 
-The concentration factor is intended to describe how strongly an ETF's current
-portfolio is concentrated in a small number of holdings. Its eventual definition
-must identify the holdings date, source, coverage, cash treatment, and handling
-of incomplete weights.
+Concentration is deferred pending a production-eligible holdings and
+economic-entity-mapping architecture. The following is the approved future raw
+methodology and its data-integrity boundary. It is not implemented.
 
-Concentration will initially be a current-only factor. Current ETF holdings must
-not be applied retroactively to historical periods because doing so would
-introduce look-ahead bias. Historical concentration may be incorporated later
-only if reliable point-in-time holdings snapshots become available and their
-availability dates can be audited.
+#### Financial purpose and interpretation
+
+Concentration will be current-only. Current holdings must never be applied
+retroactively because that would misstate the historical information set and
+introduce look-ahead bias. Historical Concentration would require point-in-time
+holdings snapshots, auditable publication and retrieval timing, and mappings
+valid for each historical observation.
+
+The preferred future raw metric is direct-long-equity economic-entity HHI. For
+each eligible economic entity `e`, define:
+
+```text
+p_e = (
+    aggregated eligible direct-long equity weight for entity e
+    / total eligible mapped direct-long equity weight
+)
+
+raw_hhi = sum(p_e ** 2)
+hhi_points = 10,000 * raw_hhi
+effective_holdings = 1 / raw_hhi
+top_10_weight_pct = 100 * sum of the ten largest p_e values
+```
+
+`raw_hhi` is dimensionless. `hhi_points` is measured in HHI points,
+`effective_holdings` is an effective count, and `top_10_weight_pct` is measured
+in percentage points. With `n >= 1` eligible mapped entities, `raw_hhi` ranges
+from `1 / n` to `1`, HHI points from `10,000 / n` to `10,000`, and effective
+holdings from `1` to `n`. Top-10 weight is no greater than 100% and equals 100%
+when ten or fewer entities are included.
+
+HHI points, effective holdings, and top-10 weight are diagnostics. Higher HHI
+and top-10 weight and lower effective holdings indicate greater disclosed
+direct-long portfolio concentration. These measures do not establish investor
+crowding, fund flows, positioning, liquidity stress, valuation excess,
+overheating, crash risk, or future returns.
+
+#### Position scope and reconciliation
+
+Only eligible positive direct-long equity weights enter the future HHI
+numerator. Cash, currencies, receivables, payables, liabilities, collateral,
+futures, swaps, options, other derivatives, short positions, pooled funds, and
+unknown instruments remain outside the numerator but must remain visible in
+reconciliation diagnostics. Day 7 performs no fund-of-funds look-through.
+
+Negative positions must not be squared, converted to positive weights, or
+netted into direct-long weights. Derivative market value, notional, or
+delta-adjusted exposure must not replace direct-long equity weight. Pooled funds
+must not be treated as their underlying securities without a separately
+approved look-through methodology.
+
+Exact duplicate rows may be aggregated only after a stable security identifier
+and identical economic meaning are established. Multiple share classes,
+depositary receipts, and local listings may be aggregated to one economic entity
+only through deterministic mapping. Ticker or company-name matching is not an
+acceptable substitute.
+
+Renormalization over eligible mapped direct-long equity weights is permitted
+only after all of the following have been validated:
+
+- the source identifies the correct legal fund or series and represents complete
+  holdings for its stated scope;
+- holdings as-of date, publication timing, and retrieval timing are auditable;
+- required fields, identifiers, units, signs, and weight basis are established;
+- every row is classified and duplicates are resolved deterministically;
+- every included direct-long equity row has a valid positive weight and the
+  mapping required by the selected metric;
+- raw totals and excluded-position buckets pass a source-specific reconciliation
+  contract; and
+- the observation satisfies a future approved freshness policy.
+
+No universal `98-102%` total-weight gate, `95%` direct-equity gate, `99%`
+mapping gate, or `1%` unknown-position gate is approved. The official-source
+study found no empirical support for those proposed values. Source totals may
+not have comparable relationships to NAV, so any future gate must be supported
+by authorized samples and source-specific semantics.
+
+Missing, stale, partial, truncated, ambiguous, internally inconsistent, or
+unmappable data produce `NaN`. Do not fill, carry forward, clip, winsorize,
+substitute neutrality, automatically redistribute missing weights, or
+substitute another component. An older observation may be displayed only as a
+separately labeled stale diagnostic; it must not replace a current result.
+
+#### Identifiers and economic-entity mapping
+
+Economic-entity aggregation requires deterministic, versioned mappings from
+security to issuing entity and from issuer to the selected parent entity. The
+mapping source, relationship type, version or retrieval vintage, and applicable
+date must be auditable. Open official sources have not demonstrated complete
+ultimate-parent coverage for the configured holdings. Licensed mapping access,
+point-in-time coverage, archival rights, and permission to display derived
+results remain unresolved.
+
+Security-level HHI remains a material initial alternative but is not the
+approved economic-entity metric. If later approved, it must be named
+`security-level concentration`; it must not be presented as economic-entity
+concentration because separate share classes or listings can split one economic
+exposure across multiple securities.
+
+#### Freshness, universe, and normalization status
+
+No universal two-XNYS-session freshness rule is approved. Official-source
+research found that this rule is incompatible with the monthly complete-holdings
+publication cadence for VTI and VGT. A 22-ETF daily cohort must not silently
+replace the configured 24-ETF universe.
+
+A lagged common-month-end cohort and issuer-specific raw observations remain
+material future alternatives, not approved production methodology. Their date
+semantics, staleness interpretation, source eligibility, and display treatment
+would require separate approval.
+
+No cross-sectional Concentration percentile is defined. Current-observation
+inclusion, normalization population, eligibility denominator, minimum eligible
+ETF count, and realized percentile range therefore remain undecided. Do not
+reuse Momentum or Volatility normalization for Concentration.
+
+#### Relationship to other components
+
+Any future Concentration diagnostics would remain separate from implemented
+Momentum and Volatility. They would not change either component's input,
+calendar, normalization, timing, or interpretation. Flow remains deferred.
+Do not define a composite, component weights, thresholds, risk classes,
+missing-component substitution, or a Crowding Score.
 
 ### 4. Volatility
 
@@ -849,16 +973,18 @@ actual ETF eligibility.
 
 ## Composite score status
 
-No historical or current composite has been approved. Flow is deferred, and the
-project will not redefine the planned composite as Momentum plus Volatility or
-otherwise finalize a reduced-factor substitute. Composite inputs, weights,
-thresholds, interpretation, and naming remain undecided.
+No historical or current composite has been approved. Flow and Concentration
+are deferred, and the project will not redefine the planned composite as
+Momentum plus Volatility or otherwise finalize a reduced-factor substitute.
+Composite inputs, weights, thresholds, interpretation, and naming remain
+undecided.
 
-Current holdings may eventually support a current concentration measurement if
-their date and source are disclosed, but this does not define a current score.
-Likewise, the availability of Momentum and Volatility alone does not justify a
-historical score. A result lacking direct positioning or flow evidence must not
-be called a Crowding Score merely because Momentum and Volatility are present.
+Production-eligible current holdings and deterministic economic-entity mappings
+may eventually support a current Concentration measurement, but this does not
+define a score. Likewise, the availability of Momentum and Volatility alone
+does not justify a historical score. A result lacking direct positioning or
+flow evidence must not be called a Crowding Score merely because Momentum and
+Volatility are present.
 
 Any future composite will require transparent definitions, hand-calculated unit
 tests, sensitivity analysis, point-in-time controls, and explicit missing-input
@@ -871,8 +997,8 @@ behavior before it is presented as a result.
   look-ahead risk.
 - Legitimately unavailable observations will remain missing and be flagged.
 - Values will not be silently forward-filled.
-- Current holdings can support a current concentration score but not a
-  historical concentration series.
+- Production-eligible current holdings may support a current Concentration
+  measurement but not a historical series.
 - Estimated creation/redemption activity will always be labeled as a proxy.
 
 ## Anticipated limitations
@@ -902,7 +1028,11 @@ valuation, and data-quality differences may affect the estimate.
 
 Current holdings describe the current portfolio only. Applying them to earlier
 dates would misstate the information set and introduce look-ahead bias. Historical
-concentration therefore depends on obtaining reliable point-in-time snapshots.
+Concentration therefore depends on reliable point-in-time snapshots with
+auditable availability timing. Current Concentration is also deferred because
+holdings contracts and deterministic economic-parent mapping are not yet
+production-eligible. See
+[`concentration-data-source-feasibility.md`](concentration-data-source-feasibility.md).
 
 ### Third-party market-data availability
 

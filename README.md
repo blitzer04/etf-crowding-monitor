@@ -52,8 +52,8 @@ The monitor's research design considers four interpretable factors:
    shares outstanding, clearly distinguished from reported fund flows.
 2. **Momentum:** an implemented XNYS-aligned, per-ETF percentile of trailing
    252-session adjusted-price log returns.
-3. **Concentration:** a current holdings-based measure of how strongly an ETF is
-   exposed to a small number of constituents.
+3. **Concentration:** a deferred current-only measure whose preferred future
+   raw metric is direct-long-equity economic-entity HHI.
 4. **Volatility:** an implemented XNYS-aligned, per-ETF percentile of
    21-session annualized adjusted-price return dispersion.
 
@@ -66,17 +66,28 @@ naming remain undecided. In particular, an indicator containing Momentum and
 Volatility but no direct positioning or flow evidence will not be called a
 Crowding Score merely because those components are available.
 
-Current holdings will not be applied retroactively because that would introduce
-look-ahead bias. Definitions, alignment rules, and limitations are documented in
+Concentration is deferred pending a production-eligible holdings and
+economic-entity-mapping architecture. It remains current-only, and current
+holdings will never be applied retroactively. Its preferred future raw
+methodology is direct-long-equity economic-entity HHI, but no Concentration
+calculation is implemented. Eligibility thresholds, freshness rules,
+normalization, and cross-sectional percentiles remain unapproved. No composite,
+component weights, thresholds, risk classes, or Crowding Score has been defined.
+
+Definitions, alignment rules, and limitations are documented in
 [`docs/methodology.md`](docs/methodology.md). The dated evidence behind the Flow
 decision is recorded separately in
 [`docs/flow-data-source-feasibility.md`](docs/flow-data-source-feasibility.md).
+The official-source feasibility work supporting the Concentration deferral is
+recorded in
+[`docs/concentration-data-source-feasibility.md`](docs/concentration-data-source-feasibility.md).
 
 Historical daily price ingestion/persistence, historical shares-outstanding
 ingestion/persistence, and the standalone Momentum and Volatility components
 are implemented. This describes pipeline and calculation availability, not
 empirical suitability of the current shares source for Flow scoring. The
-creation/redemption flow proxy, Concentration, composite scores, backtests,
+creation/redemption flow proxy and Concentration component remain deferred.
+Holdings ingestion, Concentration calculations, composite scores, backtests,
 application work, and empirical conclusions are not implemented.
 
 ## Planned project architecture
@@ -448,6 +459,30 @@ next XNYS session. Its history uses the current adjusted-price vintage and is
 exploratory rather than a point-in-time backtest. It is not a Crowding Score and
 does not replace deferred Flow or define a composite, weights, or thresholds.
 
+## Concentration status
+
+Day 7 approved methodology and completed official-source feasibility research;
+it did not implement Concentration or retrieve holdings files. Concentration is
+deferred until holdings and deterministic, versioned
+security-to-issuer-to-parent mappings are production-eligible. Ticker and
+company-name heuristics are not acceptable substitutes.
+
+The preferred future raw metric is economic-entity HHI over eligible mapped
+direct-long equity weights. HHI points, effective holdings, and top-10 weight
+would be diagnostics of disclosed portfolio concentration. They would not
+establish investor crowding, fund flows, positioning, liquidity stress,
+valuation excess, overheating, crash risk, or future returns.
+
+Cash, liabilities, collateral, derivatives, short positions, pooled funds, and
+unknown instruments would remain outside the HHI numerator but visible in
+reconciliation diagnostics. Missing, stale, partial, ambiguous, or unmappable
+inputs would remain missing. The project has not approved universal numeric
+coverage gates, a universal two-XNYS-session freshness rule, a cross-sectional
+Concentration percentile, or a 22-ETF substitute for the configured universe.
+See [`docs/methodology.md`](docs/methodology.md) for the locked methodology and
+[`docs/concentration-data-source-feasibility.md`](docs/concentration-data-source-feasibility.md)
+for the evidence boundary and unexecuted validation plan.
+
 ## Technology stack
 
 - Python 3.12
@@ -466,10 +501,14 @@ shares-outstanding ingestion, validation, incremental Parquet persistence, and
 the command-line update workflow. Day 4 finalized the future Flow methodology,
 audited source feasibility, and deferred Flow because no production-eligible
 source exists. Subsequent phases implemented the standalone Momentum and
-Volatility components and their audit diagnostics.
+Volatility components and their audit diagnostics. Day 7 performed
+Concentration methodology design and official-source feasibility research and
+deferred implementation pending production-eligible holdings and
+economic-entity mapping.
 Pipeline implementation must not be confused with source suitability. The
-creation/redemption flow proxy, holdings, concentration, composite scores,
-backtests, analysis case studies, and Streamlit pages are not yet implemented.
+creation/redemption flow proxy, holdings ingestion, Concentration calculations,
+composite scores, backtests, analysis case studies, and Streamlit pages are not
+implemented.
 
 ## Data limitations
 
@@ -477,11 +516,12 @@ Limitations include survivorship bias from the present-day curated universe,
 third-party price and shares-data availability and revisions, missing
 observations, the empirically unsuitable Yahoo/yfinance shares coverage observed
 on 2026-08-21, the difference between a future flow proxy and reported flows,
-and lack of historical point-in-time holdings. The audit does not establish the
-provider's undocumented internal cause. Missing data are not silently invented
-or forward-filled. Each canonical row records a client-side retrieval time, but
-Yahoo Finance does not provide an exchange-authoritative publication timestamp
-for every historical observation.
+nonuniform issuer holdings contracts, unresolved economic-parent mapping and
+display rights, and lack of historical point-in-time holdings. The Flow audit
+does not establish the provider's undocumented internal cause. Missing data are
+not silently invented or forward-filled. Each canonical price and shares row
+records a client-side retrieval time, but Yahoo Finance does not provide an
+exchange-authoritative publication timestamp for every historical observation.
 
 ## Installation
 
