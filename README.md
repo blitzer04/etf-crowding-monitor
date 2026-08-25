@@ -81,6 +81,9 @@ decision is recorded separately in
 The official-source feasibility work supporting the Concentration deferral is
 recorded in
 [`docs/concentration-data-source-feasibility.md`](docs/concentration-data-source-feasibility.md).
+The controlled 2026-08-25 price refresh and independent artifact audit are
+recorded in
+[`docs/price-signal-empirical-audit-2026-08-25.md`](docs/price-signal-empirical-audit-2026-08-25.md).
 
 Historical daily price ingestion/persistence, historical shares-outstanding
 ingestion/persistence, and the standalone Momentum and Volatility components
@@ -88,7 +91,9 @@ are implemented. This describes pipeline and calculation availability, not
 empirical suitability of the current shares source for Flow scoring. The
 creation/redemption flow proxy and Concentration component remain deferred.
 Holdings ingestion, Concentration calculations, composite scores, backtests,
-application work, and empirical conclusions are not implemented.
+and application work are not implemented. One dated current-vintage
+Momentum/Volatility evaluation has been completed and independently audited;
+it is exploratory evidence, not a point-in-time backtest or a composite result.
 
 ## Planned project architecture
 
@@ -520,11 +525,15 @@ runs. Modifications after the function returns cannot be prevented, so consumers
 must verify manifest hashes before use. Run bundles are generated local data;
 they are not automatically published or committed.
 
-Day 8.2 implemented and tested this workflow with synthetic data only. It did
-not execute `--refresh`, retrieve market data, or produce empirical ETF results.
-Any later historical output will use the then-current adjusted-price vintage,
-not a reconstruction of prior provider vintages. It is therefore exploratory,
-not a point-in-time backtest, and the present-day configured universe retains
+Day 8.2 implemented and tested this workflow with synthetic data only. On
+2026-08-25, Day 9 subsequently executed one separately authorized refresh and
+independently audited the resulting current-vintage artifacts. The canonical
+Parquet and run bundle are local Git-ignored data and are not part of the
+repository; the tracked audit record is
+[`docs/price-signal-empirical-audit-2026-08-25.md`](docs/price-signal-empirical-audit-2026-08-25.md).
+Historical output uses that run's current adjusted-price vintage, not a
+reconstruction of prior provider vintages. It is therefore exploratory, not a
+point-in-time backtest, and the present-day configured universe retains
 survivorship bias. Correlations are descriptive only and do not establish
 causality, predictive value, crowding, or suitability for a composite.
 
@@ -574,12 +583,14 @@ Volatility components and their audit diagnostics. Day 7 performed
 Concentration methodology design and official-source feasibility research and
 deferred implementation pending production-eligible holdings and
 economic-entity mapping. Day 8 implements an offline-first standalone
-Momentum/Volatility evaluation and reproducible local bundle workflow; no live
-price refresh or empirical ETF analysis has been run.
+Momentum/Volatility evaluation and reproducible local bundle workflow. Day 9
+completed one controlled live price refresh and an independent read-only audit
+of its local Git-ignored artifacts; the resulting analysis is current-vintage
+and exploratory rather than a point-in-time backtest.
 Pipeline implementation must not be confused with source suitability. The
 creation/redemption flow proxy, holdings ingestion, Concentration calculations,
-composite scores, backtests, analysis case studies, and Streamlit pages are not
-implemented.
+composite scores, point-in-time backtests, production analysis case studies, and
+Streamlit pages are not implemented.
 
 ## Data limitations
 
@@ -588,10 +599,11 @@ third-party price and shares-data availability and revisions, missing
 observations, the empirically unsuitable Yahoo/yfinance shares coverage observed
 on 2026-08-21, the difference between a future flow proxy and reported flows,
 nonuniform issuer holdings contracts, unresolved economic-parent mapping and
-display rights, and lack of historical point-in-time holdings. The Flow audit
-does not establish the provider's undocumented internal cause. Missing data are
-not silently invented or forward-filled. Each canonical price and shares row
-records a client-side retrieval time, but Yahoo Finance does not provide an
+display rights, unresolved public redistribution and derived-display rights,
+and lack of historical point-in-time holdings. The Flow audit does not establish
+the provider's undocumented internal cause. Missing data are not silently
+invented or forward-filled. Each canonical price and shares row records a
+client-side retrieval time, but Yahoo Finance does not provide an
 exchange-authoritative publication timestamp for every historical observation.
 
 ## Installation

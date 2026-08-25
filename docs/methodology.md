@@ -5,10 +5,13 @@
 This document describes the implemented price and shares-outstanding data
 foundations, the implemented standalone Momentum and Volatility calculations,
 and the intended research design for the U.S. ETF Crowding & Overheating Risk
-Monitor. No Flow or Concentration component, composite score, thresholds,
-backtests, or empirical conclusions exist at this stage. Momentum and
-Volatility are standalone diagnostic components, and neither is a Crowding
-Score.
+Monitor. No Flow or Concentration component is implemented, and no composite
+score, threshold set, or point-in-time backtest exists at this stage. Momentum
+and Volatility are standalone diagnostic components, and neither is a Crowding
+Score. One
+controlled current-vintage price-signal evaluation was completed and audited on
+2026-08-25; its bounded empirical record is documented in
+[`price-signal-empirical-audit-2026-08-25.md`](price-signal-empirical-audit-2026-08-25.md).
 
 Flow is deferred from both historical and current scores because the current
 shares source did not pass the approved event-time acceptance specification.
@@ -967,9 +970,11 @@ the corresponding theoretical calendar dates are:
 - first normalized Volatility: `2019-02-04`;
 - first prospective-use date: `2019-02-05`.
 
-These are theoretical calendar dates, not empirical ETF coverage results. The
-repository currently has no canonical price dataset against which to establish
-actual ETF eligibility.
+These dates were theoretical before a live dataset existed. The tracked
+repository still contains no canonical price data, but the local Git-ignored
+2026-08-25 dataset independently confirmed these eligibility dates for every
+configured ETF. See
+[`price-signal-empirical-audit-2026-08-25.md`](price-signal-empirical-audit-2026-08-25.md).
 
 ## Standalone Momentum and Volatility evaluation workflow
 
@@ -1114,10 +1119,14 @@ point-in-time backtest. The present-day configured ETF universe also introduces
 survivorship bias.
 
 Day 8.2 used deterministic synthetic data to implement and test the workflow. It
-did not execute refresh mode, retrieve market data, or produce empirical ETF
-results. Flow and Concentration remain deferred. Do not define a composite,
-component weights, thresholds, risk classes, missing-component reweighting, or a
-Crowding Score.
+did not execute refresh mode or retrieve market data. Day 9 later completed one
+separately authorized live refresh and an independent read-only audit. The
+canonical input and bundle remain local Git-ignored artifacts rather than
+repository-tracked data; the tracked findings are recorded in
+[`price-signal-empirical-audit-2026-08-25.md`](price-signal-empirical-audit-2026-08-25.md).
+Flow and Concentration remain deferred. Do not define a composite, component
+weights, thresholds, risk classes, missing-component reweighting, or a Crowding
+Score.
 
 ## Composite score status
 
