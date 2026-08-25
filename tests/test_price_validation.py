@@ -5,10 +5,12 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from types import GeneratorType
+from typing import Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -17,7 +19,11 @@ import pytest
 from pandas.api.types import is_any_real_numeric_dtype
 
 import etf_crowding.data.prices as price_module
-from etf_crowding.data.prices import TickerDownloadStatus, persist_price_history
+from etf_crowding.data.prices import (
+    TickerDownloadStatus,
+    persist_price_history,
+    validate_price_retrieval_statuses,
+)
 from etf_crowding.data.validation import (
     PRICE_VALUE_COLUMNS,
     PriceDataValidationError,
@@ -118,7 +124,7 @@ def _retrieval_status(
     *,
     start: str = "2024-01-01",
     end: str = "2024-01-05",
-    retrieved_at: datetime | None = RETRIEVED_AT,
+    retrieved_at: datetime | pd.Timestamp | None = RETRIEVED_AT,
 ) -> TickerDownloadStatus:
     resolved_dates = tuple(date.fromisoformat(value) for value in returned_dates)
     return TickerDownloadStatus(
@@ -127,12 +133,301 @@ def _retrieval_status(
         rows_received=len(resolved_dates),
         first_date=min(resolved_dates) if resolved_dates else None,
         last_date=max(resolved_dates) if resolved_dates else None,
-        retrieved_at=None if status == "failed" else retrieved_at,
+        retrieved_at=(
+            None
+            if status == "failed" or retrieved_at is None
+            else pd.Timestamp(retrieved_at)
+        ),
         error="synthetic failure" if status == "failed" else None,
         query_start=date.fromisoformat(start),
         query_end=date.fromisoformat(end),
         returned_dates=resolved_dates,
     )
+
+
+def _two_ticker_prices() -> pd.DataFrame:
+    spy = _canonical_prices()
+    qqq = spy.copy()
+    qqq["ticker"] = "QQQ"
+    return pd.concat([spy, qqq], ignore_index=True)
+
+
+class _DateTuple(tuple[date, ...]):
+    pass
+
+
+def test_public_retrieval_status_validator_preserves_nanoseconds() -> None:
+    retrieved_at = pd.Timestamp("2024-11-29T18:01:02.987654321Z")
+    incoming = _canonical_prices().iloc[[0]].copy()
+    incoming["retrieved_at"] = retrieved_at
+    status = _retrieval_status(
+        "SPY",
+        "success",
+        ("2024-01-02",),
+        start="2024-01-01",
+        end="2024-01-03",
+        retrieved_at=retrieved_at,
+    )
+
+    validated = validate_price_retrieval_statuses(
+        incoming,
+        (status,),
+        expected_tickers=("SPY",),
+        expected_query_start=date(2024, 1, 1),
+        expected_query_end=date(2024, 1, 3),
+    )
+
+    assert validated == (status,)
+    assert validated[0].retrieved_at == retrieved_at
+    assert incoming["retrieved_at"].iloc[0] == retrieved_at
+
+
+@pytest.mark.parametrize(
+    ("qqq_start", "qqq_end"),
+    [
+        pytest.param("2024-01-02", "2024-01-05", id="different-start"),
+        pytest.param("2024-01-01", "2024-01-04", id="different-end"),
+    ],
+)
+def test_retrieval_statuses_always_require_one_common_query_window(
+    qqq_start: str,
+    qqq_end: str,
+) -> None:
+    incoming = _two_ticker_prices()
+    statuses = (
+        _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03")),
+        _retrieval_status(
+            "QQQ",
+            "success",
+            ("2024-01-02", "2024-01-03"),
+            start=qqq_start,
+            end=qqq_end,
+        ),
+    )
+    incoming_snapshot = incoming.copy(deep=True)
+
+    with pytest.raises(PriceDataValidationError, match="one common query window"):
+        validate_price_retrieval_statuses(incoming, statuses)
+
+    pd.testing.assert_frame_equal(incoming, incoming_snapshot, check_exact=True)
+    assert statuses[1].query_start == date.fromisoformat(qqq_start)
+    assert statuses[1].query_end == date.fromisoformat(qqq_end)
+
+
+def test_retrieval_statuses_reject_mixed_outcome_query_windows() -> None:
+    incoming = _canonical_prices()
+    statuses = (
+        _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03")),
+        _retrieval_status("QQQ", "empty"),
+        _retrieval_status("IWM", "failed", start="2024-01-02"),
+    )
+
+    with pytest.raises(PriceDataValidationError, match="one common query window"):
+        validate_price_retrieval_statuses(incoming, statuses)
+
+
+def test_reported_mixed_window_reproduction_is_rejected() -> None:
+    incoming = _two_ticker_prices()
+    incoming = incoming.loc[
+        ~(
+            incoming["ticker"].eq("SPY")
+            & incoming["date"].eq(pd.Timestamp("2024-01-02"))
+        )
+    ].reset_index(drop=True)
+    statuses = (
+        _retrieval_status(
+            "SPY",
+            "success",
+            ("2024-01-03",),
+            start="2024-01-03",
+        ),
+        _retrieval_status("QQQ", "success", ("2024-01-02", "2024-01-03")),
+    )
+
+    with pytest.raises(PriceDataValidationError, match="one common query window"):
+        validate_price_retrieval_statuses(incoming, statuses)
+
+
+def test_retrieval_status_common_window_is_valid_without_expected_bounds() -> None:
+    incoming = _two_ticker_prices()
+    statuses = (
+        _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03")),
+        _retrieval_status("QQQ", "success", ("2024-01-02", "2024-01-03")),
+        _retrieval_status("IWM", "empty"),
+        _retrieval_status("DIA", "failed"),
+    )
+
+    validated = validate_price_retrieval_statuses(incoming, statuses)
+
+    assert validated == statuses[:2]
+
+
+def test_retrieval_status_common_window_matches_expected_bounds() -> None:
+    incoming = _two_ticker_prices()
+    statuses = (
+        _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03")),
+        _retrieval_status("QQQ", "success", ("2024-01-02", "2024-01-03")),
+    )
+
+    validated = validate_price_retrieval_statuses(
+        incoming,
+        statuses,
+        expected_query_start=date(2024, 1, 1),
+        expected_query_end=date(2024, 1, 5),
+    )
+
+    assert validated == statuses
+
+
+@pytest.mark.parametrize(
+    ("expected_start", "expected_end", "message"),
+    [
+        pytest.param(date(2024, 1, 2), date(2024, 1, 5), "expected start", id="start"),
+        pytest.param(date(2024, 1, 1), date(2024, 1, 4), "expected end", id="end"),
+    ],
+)
+def test_retrieval_status_common_window_must_match_expected_bounds(
+    expected_start: date,
+    expected_end: date,
+    message: str,
+) -> None:
+    incoming = _canonical_prices()
+    status = _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03"))
+
+    with pytest.raises(PriceDataValidationError, match=message):
+        validate_price_retrieval_statuses(
+            incoming,
+            (status,),
+            expected_query_start=expected_start,
+            expected_query_end=expected_end,
+        )
+
+
+@pytest.mark.parametrize(
+    ("expected_start", "expected_end"),
+    [
+        pytest.param(date(2024, 1, 1), None, id="start-only"),
+        pytest.param(None, date(2024, 1, 5), id="end-only"),
+    ],
+)
+def test_retrieval_status_expected_bounds_must_be_supplied_together(
+    expected_start: date | None,
+    expected_end: date | None,
+) -> None:
+    with pytest.raises(PriceDataValidationError, match="supplied together"):
+        validate_price_retrieval_statuses(
+            _canonical_prices(),
+            (_retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03")),),
+            expected_query_start=expected_start,
+            expected_query_end=expected_end,
+        )
+
+
+def test_empty_retrieval_status_population_preserves_existing_contract() -> None:
+    empty = _canonical_prices().iloc[0:0].copy()
+
+    assert validate_price_retrieval_statuses(empty, ()) == ()
+    assert (
+        validate_price_retrieval_statuses(
+            empty,
+            (),
+            expected_query_start=date(2024, 1, 1),
+            expected_query_end=date(2024, 1, 5),
+        )
+        == ()
+    )
+    with pytest.raises(PriceDataValidationError, match="coverage tickers"):
+        validate_price_retrieval_statuses(_canonical_prices(), ())
+
+
+def test_retrieval_status_returned_dates_accepts_exact_builtin_tuple() -> None:
+    incoming = _canonical_prices()
+    status = _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03"))
+
+    validated = validate_price_retrieval_statuses(incoming, (status,))
+
+    assert type(status.returned_dates) is tuple
+    assert validated == (status,)
+
+
+@pytest.mark.parametrize(
+    "returned_dates",
+    [
+        pytest.param(
+            _DateTuple((date(2024, 1, 2), date(2024, 1, 3))),
+            id="tuple-subclass",
+        ),
+        pytest.param([date(2024, 1, 2), date(2024, 1, 3)], id="list"),
+        pytest.param(
+            np.array([date(2024, 1, 2), date(2024, 1, 3)], dtype=object),
+            id="numpy-array",
+        ),
+        pytest.param(
+            pd.Index([date(2024, 1, 2), date(2024, 1, 3)]),
+            id="pandas-index",
+        ),
+        pytest.param(
+            (value for value in (date(2024, 1, 2), date(2024, 1, 3))),
+            id="generator",
+        ),
+    ],
+)
+def test_retrieval_status_returned_dates_requires_exact_builtin_tuple(
+    returned_dates: object,
+) -> None:
+    incoming = _canonical_prices()
+    incoming_snapshot = incoming.copy(deep=True)
+    valid = _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03"))
+    malformed = replace(
+        valid,
+        returned_dates=cast(tuple[date, ...], returned_dates),
+    )
+
+    with pytest.raises(PriceDataValidationError, match="tuple of returned dates"):
+        validate_price_retrieval_statuses(incoming, (malformed,))
+
+    pd.testing.assert_frame_equal(incoming, incoming_snapshot, check_exact=True)
+    assert malformed.returned_dates is returned_dates
+    if isinstance(returned_dates, GeneratorType):
+        assert tuple(returned_dates) == (date(2024, 1, 2), date(2024, 1, 3))
+
+
+@pytest.mark.parametrize(
+    "retrieved_at",
+    [
+        pytest.param(datetime(2024, 11, 29, 18, 1, 2), id="naive"),
+        pytest.param(
+            datetime(2024, 11, 29, 18, 1, 2, tzinfo=UTC),
+            id="python-datetime",
+        ),
+        pytest.param(pd.NaT, id="nat"),
+        pytest.param(
+            pd.Timestamp("2024-11-29T10:01:02.987654321-08:00"),
+            id="non-utc",
+        ),
+        pytest.param("2024-11-29T18:01:02.987654321Z", id="string"),
+    ],
+)
+def test_public_retrieval_status_validator_rejects_invalid_timestamp_metadata(
+    retrieved_at: object,
+) -> None:
+    incoming = _canonical_prices().iloc[[0]].copy()
+    status = _retrieval_status("SPY", "success", ("2024-01-02",))
+    malformed = TickerDownloadStatus(
+        ticker=status.ticker,
+        status=status.status,
+        rows_received=status.rows_received,
+        first_date=status.first_date,
+        last_date=status.last_date,
+        retrieved_at=cast(pd.Timestamp | None, retrieved_at),
+        query_start=status.query_start,
+        query_end=status.query_end,
+        returned_dates=status.returned_dates,
+        error=status.error,
+    )
+
+    with pytest.raises(PriceDataValidationError, match="retrieved_at"):
+        validate_price_retrieval_statuses(incoming, (malformed,))
 
 
 def _price_row_with_decimal(value: Decimal | None) -> pd.DataFrame:
@@ -1400,6 +1695,28 @@ def test_string_retrieved_at_column_is_rejected_before_persistence(
     assert not output_path.exists()
 
 
+@pytest.mark.parametrize("case", ["naive", "nat", "non_utc"])
+def test_invalid_canonical_retrieval_timestamp_metadata_is_rejected(
+    case: str,
+) -> None:
+    invalid = _canonical_prices()
+    if case == "naive":
+        invalid["retrieved_at"] = invalid["retrieved_at"].dt.tz_localize(None)
+    elif case == "nat":
+        invalid.loc[0, "retrieved_at"] = pd.NaT
+    elif case == "non_utc":
+        invalid["retrieved_at"] = invalid["retrieved_at"].dt.tz_convert(
+            "America/New_York"
+        )
+    else:
+        raise AssertionError(f"Unhandled timestamp case: {case}")
+
+    with pytest.raises(
+        PriceDataValidationError, match="retrieved_at|Retrieval timestamp"
+    ):
+        validate_price_data(invalid)
+
+
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -1718,6 +2035,134 @@ def test_successful_coverage_date_matching_is_independent_of_incoming_row_order(
         pd.Timestamp("2024-01-03"),
     ]
     assert result.prices["retrieved_at"].eq(NEW_RETRIEVED_AT).all()
+
+
+@pytest.mark.parametrize(
+    ("qqq_start", "qqq_end"),
+    [
+        pytest.param("2024-01-02", "2024-01-05", id="different-start"),
+        pytest.param("2024-01-01", "2024-01-04", id="different-end"),
+    ],
+)
+def test_persistence_rejects_mixed_retrieval_windows_before_artifacts(
+    tmp_path: Path,
+    qqq_start: str,
+    qqq_end: str,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    snapshot_dir = tmp_path / "snapshots" / "prices"
+    incoming = _two_ticker_prices()
+    statuses = (
+        _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03")),
+        _retrieval_status(
+            "QQQ",
+            "success",
+            ("2024-01-02", "2024-01-03"),
+            start=qqq_start,
+            end=qqq_end,
+        ),
+    )
+
+    with pytest.raises(PriceDataValidationError, match="one common query window"):
+        persist_price_history(
+            incoming,
+            output_path,
+            retrieval_statuses=statuses,
+            snapshot_dir=snapshot_dir,
+            snapshot_time=SNAPSHOT_TIME,
+        )
+
+    assert not output_path.exists()
+    assert not snapshot_dir.exists()
+
+
+def test_persistence_rejects_mixed_outcome_query_windows_before_artifacts(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    snapshot_dir = tmp_path / "snapshots" / "prices"
+    statuses = (
+        _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03")),
+        _retrieval_status("QQQ", "empty"),
+        _retrieval_status("IWM", "failed", end="2024-01-04"),
+    )
+
+    with pytest.raises(PriceDataValidationError, match="one common query window"):
+        persist_price_history(
+            _canonical_prices(),
+            output_path,
+            retrieval_statuses=statuses,
+            snapshot_dir=snapshot_dir,
+            snapshot_time=SNAPSHOT_TIME,
+        )
+
+    assert not output_path.exists()
+    assert not snapshot_dir.exists()
+
+
+def test_mixed_window_cannot_bypass_vanished_observation_protection(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    snapshot_dir = tmp_path / "snapshots" / "prices"
+    existing = _canonical_prices().iloc[[0]].copy()
+    persist_price_history(existing, output_path)
+    canonical_bytes = output_path.read_bytes()
+
+    incoming = _two_ticker_prices()
+    incoming = incoming.loc[
+        ~(
+            incoming["ticker"].eq("SPY")
+            & incoming["date"].eq(pd.Timestamp("2024-01-02"))
+        )
+    ].reset_index(drop=True)
+    statuses = (
+        _retrieval_status(
+            "SPY",
+            "success",
+            ("2024-01-03",),
+            start="2024-01-03",
+        ),
+        _retrieval_status("QQQ", "success", ("2024-01-02", "2024-01-03")),
+    )
+
+    with pytest.raises(PriceDataValidationError, match="one common query window"):
+        persist_price_history(
+            incoming,
+            output_path,
+            retrieval_statuses=statuses,
+            snapshot_dir=snapshot_dir,
+            snapshot_time=SNAPSHOT_TIME,
+        )
+
+    assert output_path.read_bytes() == canonical_bytes
+    assert not snapshot_dir.exists()
+
+
+def test_persistence_rejects_returned_dates_tuple_subclass_before_artifacts(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "etf_prices_daily.parquet"
+    snapshot_dir = tmp_path / "snapshots" / "prices"
+    valid = _retrieval_status("SPY", "success", ("2024-01-02", "2024-01-03"))
+    returned_dates = _DateTuple(valid.returned_dates)
+    malformed = replace(
+        valid,
+        returned_dates=cast(tuple[date, ...], returned_dates),
+    )
+
+    with pytest.raises(PriceDataValidationError, match="tuple of returned dates"):
+        persist_price_history(
+            _canonical_prices(),
+            output_path,
+            retrieval_statuses=(malformed,),
+            snapshot_dir=snapshot_dir,
+            snapshot_time=SNAPSHOT_TIME,
+        )
+
+    assert malformed.returned_dates is returned_dates
+    assert not output_path.exists()
+    assert not snapshot_dir.exists()
 
 
 def test_coverage_validation_does_not_hide_conflicting_duplicate_date(

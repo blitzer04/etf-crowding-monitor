@@ -82,8 +82,9 @@ class TickerDownloadStatus:
         rows_received: Number of usable canonical rows returned.
         first_date: Earliest returned trading date, when available.
         last_date: Latest returned trading date, when available.
-        retrieved_at: UTC time when a successful or empty ticker response
-            returned. Failed outcomes have no successful retrieval timestamp.
+        retrieved_at: UTC pandas timestamp when a successful or empty ticker
+            response returned. Failed outcomes have no successful retrieval
+            timestamp.
         query_start: Inclusive provider request date.
         query_end: Exclusive provider request date.
         returned_dates: Exact canonical dates returned by this ticker response.
@@ -96,7 +97,7 @@ class TickerDownloadStatus:
     rows_received: int
     first_date: date | None
     last_date: date | None
-    retrieved_at: datetime | None
+    retrieved_at: pd.Timestamp | None
     query_start: date
     query_end: date
     returned_dates: tuple[date, ...]
@@ -116,7 +117,7 @@ class PriceDownloadResult:
 
     prices: pd.DataFrame
     statuses: tuple[TickerDownloadStatus, ...]
-    retrieved_at: datetime | None
+    retrieved_at: pd.Timestamp | None
 
     @property
     def successful_tickers(self) -> tuple[str, ...]:
@@ -209,15 +210,27 @@ def get_default_price_end_date(reference_time: datetime | None = None) -> date:
     return current_time.astimezone(ZoneInfo(_US_MARKET_TIME_ZONE_NAME)).date()
 
 
-def _retrieval_timestamp(value: datetime | pd.Timestamp) -> datetime:
+def _retrieval_timestamp(value: datetime | pd.Timestamp) -> pd.Timestamp:
+    if type(value) is not datetime and not isinstance(value, pd.Timestamp):
+        raise ValueError("retrieved_at must be a datetime or pandas Timestamp.")
     timestamp = pd.Timestamp(value)
+    if pd.isna(timestamp):
+        raise ValueError("retrieved_at must be a valid timestamp.")
     if timestamp.tzinfo is None:
         raise ValueError("retrieved_at must be timezone-aware.")
-    return timestamp.tz_convert("UTC").to_pydatetime()
+    if str(timestamp.tz) != "UTC":
+        raise ValueError("retrieved_at must use the UTC timezone.")
+    return timestamp
 
 
-def _utc_now() -> datetime:
-    return datetime.now(UTC)
+def _utc_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _format_price_download_failure(error: Exception) -> str:
+    error_type_name = type(error).__name__.strip() or "Exception"
+    error_message = str(error).strip()
+    return f"{error_type_name}: {error_message}" if error_message else error_type_name
 
 
 def _normalize_tickers(tickers: Sequence[str]) -> tuple[str, ...]:
@@ -282,7 +295,7 @@ def _normalize_trading_dates(index: pd.Index) -> pd.DatetimeIndex:
 def _normalize_single_ticker(
     provider_data: pd.DataFrame,
     ticker: str,
-    retrieved_at: datetime,
+    retrieved_at: datetime | pd.Timestamp,
 ) -> pd.DataFrame:
     renamed_columns: dict[object, str] = {}
     canonical_names: list[str] = []
@@ -797,7 +810,7 @@ def download_price_history(
     successful_frames: list[pd.DataFrame] = []
 
     for ticker in requested_tickers:
-        response_timestamp: datetime | None = None
+        response_timestamp: pd.Timestamp | None = None
         try:
             provider_data = download(ticker, start_date, end_date)
             response_timestamp = timestamp_override or _utc_now()
@@ -806,7 +819,7 @@ def download_price_history(
             )
             _validate_requested_date_window(normalized, ticker, start_date, end_date)
         except Exception as error:  # Provider libraries expose varied failures.
-            error_message = f"{type(error).__name__}: {error}"
+            error_message = _format_price_download_failure(error)
             LOGGER.warning("Price download failed for %s: %s", ticker, error_message)
             statuses.append(
                 TickerDownloadStatus(
@@ -868,7 +881,9 @@ def download_price_history(
         prices = _empty_price_data()
 
     observed_timestamps = [
-        status.retrieved_at for status in statuses if status.retrieved_at is not None
+        _retrieval_timestamp(status.retrieved_at)
+        for status in statuses
+        if status.retrieved_at is not None
     ]
     return PriceDownloadResult(
         prices=prices,
@@ -1154,22 +1169,76 @@ def _harmonize_price_numeric_dtypes(
     return harmonized_existing, harmonized_incoming
 
 
-def _validate_price_retrieval_statuses(
+def validate_price_retrieval_statuses(
     incoming: pd.DataFrame,
     retrieval_statuses: Sequence[TickerDownloadStatus],
+    *,
+    expected_tickers: Sequence[str] | None = None,
+    expected_query_start: date | None = None,
+    expected_query_end: date | None = None,
 ) -> tuple[TickerDownloadStatus, ...]:
-    """Validate that coverage metadata describes the same canonical batch."""
+    """Validate retrieval coverage against its exact canonical acquisition rows.
+
+    Args:
+        incoming: Canonical rows attributed to the supplied retrieval statuses.
+            It must contain exactly the rows claimed by successful statuses and
+            no rows attributed to empty or failed statuses.
+        retrieval_statuses: Per-ticker provider outcomes to validate.
+        expected_tickers: Optional exact requested ticker population.
+        expected_query_start: Optional required inclusive query start shared by
+            every status.
+        expected_query_end: Optional required exclusive query end shared by every
+            status.
+
+    Returns:
+        Successful statuses in their supplied order.
+
+    Raises:
+        PriceDataValidationError: If status types, values, population, query
+            bounds, or canonical row relationships are invalid.
+    """
 
     statuses = tuple(retrieval_statuses)
+    if (expected_query_start is None) != (expected_query_end is None):
+        raise PriceDataValidationError(
+            "Expected price retrieval query bounds must be supplied together."
+        )
+    if expected_query_start is not None and (
+        type(expected_query_start) is not date
+        or type(expected_query_end) is not date
+        or expected_query_start >= cast(date, expected_query_end)
+    ):
+        raise PriceDataValidationError(
+            "Expected price retrieval query bounds must be a nonempty date window."
+        )
+
+    expected_ticker_tuple: tuple[str, ...] | None = None
+    if expected_tickers is not None:
+        expected_ticker_tuple = tuple(expected_tickers)
+        expected_keys: set[str] = set()
+        for ticker in expected_ticker_tuple:
+            if type(ticker) is not str or not ticker or ticker != ticker.strip():
+                raise PriceDataValidationError(
+                    "Expected price retrieval tickers must be non-empty exact "
+                    "strings without surrounding whitespace."
+                )
+            ticker_key = ticker.casefold()
+            if ticker_key in expected_keys:
+                raise PriceDataValidationError(
+                    f"Expected price retrieval tickers contain duplicate {ticker!r}."
+                )
+            expected_keys.add(ticker_key)
+
     seen_tickers: set[str] = set()
     successful_statuses: list[TickerDownloadStatus] = []
+    common_query_window: tuple[date, date] | None = None
     for status in statuses:
         if not isinstance(status, TickerDownloadStatus):
             raise PriceDataValidationError(
                 "Price retrieval coverage must contain TickerDownloadStatus values."
             )
         if (
-            not isinstance(status.ticker, str)
+            type(status.ticker) is not str
             or not status.ticker
             or status.ticker != status.ticker.strip()
         ):
@@ -1192,7 +1261,40 @@ def _validate_price_retrieval_statuses(
                 f"Price retrieval coverage for {status.ticker} has an invalid "
                 "query window."
             )
-        if not isinstance(status.returned_dates, tuple) or any(
+        status_query_window = (status.query_start, status.query_end)
+        if common_query_window is None:
+            common_query_window = status_query_window
+        elif status_query_window != common_query_window:
+            raise PriceDataValidationError(
+                "Price retrieval coverage must use one common query window for "
+                "every ticker status."
+            )
+        if type(status.status) is not str:
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} must use a string "
+                "status."
+            )
+        if type(status.rows_received) is not int:
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} must use an exact "
+                "integer rows_received value."
+            )
+        if status.first_date is not None and type(status.first_date) is not date:
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} has an invalid "
+                "first_date type."
+            )
+        if status.last_date is not None and type(status.last_date) is not date:
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} has an invalid "
+                "last_date type."
+            )
+        if status.error is not None and type(status.error) is not str:
+            raise PriceDataValidationError(
+                f"Price retrieval coverage for {status.ticker} has an invalid "
+                "error type."
+            )
+        if type(status.returned_dates) is not tuple or any(
             type(value) is not date for value in status.returned_dates
         ):
             raise PriceDataValidationError(
@@ -1217,17 +1319,29 @@ def _validate_price_retrieval_statuses(
             expected_first = status.returned_dates[0] if status.returned_dates else None
             expected_last = status.returned_dates[-1] if status.returned_dates else None
             if (
-                not status.returned_dates
+                status.rows_received <= 0
+                or not status.returned_dates
                 or status.rows_received != len(status.returned_dates)
                 or status.first_date != expected_first
                 or status.last_date != expected_last
-                or status.retrieved_at is None
                 or status.error is not None
             ):
                 raise PriceDataValidationError(
                     f"Successful price retrieval coverage for {status.ticker} is "
                     "internally inconsistent."
                 )
+            if not isinstance(status.retrieved_at, pd.Timestamp):
+                raise PriceDataValidationError(
+                    f"Price retrieval coverage for {status.ticker} must use a "
+                    "pandas Timestamp for retrieved_at."
+                )
+            try:
+                _retrieval_timestamp(status.retrieved_at)
+            except (TypeError, ValueError) as error:
+                raise PriceDataValidationError(
+                    f"Price retrieval coverage for {status.ticker} has an invalid "
+                    "retrieved_at timestamp."
+                ) from error
             successful_statuses.append(status)
         elif status.status == "empty":
             if (
@@ -1235,13 +1349,24 @@ def _validate_price_retrieval_statuses(
                 or status.first_date is not None
                 or status.last_date is not None
                 or status.returned_dates
-                or status.retrieved_at is None
                 or status.error is not None
             ):
                 raise PriceDataValidationError(
                     f"Empty price retrieval coverage for {status.ticker} is "
                     "internally inconsistent."
                 )
+            if not isinstance(status.retrieved_at, pd.Timestamp):
+                raise PriceDataValidationError(
+                    f"Price retrieval coverage for {status.ticker} must use a "
+                    "pandas Timestamp for retrieved_at."
+                )
+            try:
+                _retrieval_timestamp(status.retrieved_at)
+            except (TypeError, ValueError) as error:
+                raise PriceDataValidationError(
+                    f"Price retrieval coverage for {status.ticker} has an invalid "
+                    "retrieved_at timestamp."
+                ) from error
         elif status.status == "failed":
             if (
                 status.rows_received != 0
@@ -1249,6 +1374,9 @@ def _validate_price_retrieval_statuses(
                 or status.last_date is not None
                 or status.returned_dates
                 or status.retrieved_at is not None
+                or type(status.error) is not str
+                or not status.error
+                or status.error != status.error.strip()
             ):
                 raise PriceDataValidationError(
                     f"Failed price retrieval coverage for {status.ticker} is "
@@ -1260,6 +1388,29 @@ def _validate_price_retrieval_statuses(
                 f"status {status.status!r}."
             )
 
+    if expected_query_start is not None and common_query_window is not None:
+        if common_query_window[0] != expected_query_start:
+            raise PriceDataValidationError(
+                "The common price retrieval query start does not match the "
+                "required expected start."
+            )
+        if common_query_window[1] != expected_query_end:
+            raise PriceDataValidationError(
+                "The common price retrieval query end does not match the required "
+                "expected end."
+            )
+
+    if expected_ticker_tuple is not None:
+        actual_tickers = tuple(status.ticker for status in statuses)
+        if len(actual_tickers) != len(expected_ticker_tuple) or set(
+            actual_tickers
+        ) != set(expected_ticker_tuple):
+            raise PriceDataValidationError(
+                "Price retrieval coverage tickers do not exactly match the "
+                "expected ticker population."
+            )
+
+    validate_price_data(incoming)
     incoming_tickers = set(incoming["ticker"].array)
     successful_tickers = {status.ticker for status in successful_statuses}
     if incoming_tickers != successful_tickers:
@@ -1280,13 +1431,18 @@ def _validate_price_retrieval_statuses(
                 "exactly match the incoming canonical rows."
             )
         try:
-            status_timestamp = _retrieval_timestamp(cast(datetime, status.retrieved_at))
+            status_timestamp = _retrieval_timestamp(
+                cast(pd.Timestamp, status.retrieved_at)
+            )
         except ValueError as error:
             raise PriceDataValidationError(
                 f"Price retrieval coverage for {status.ticker} has an invalid "
                 "retrieved_at timestamp."
             ) from error
-        if not ticker_rows["retrieved_at"].eq(pd.Timestamp(status_timestamp)).all():
+        if (
+            len(ticker_rows) != status.rows_received
+            or not ticker_rows["retrieved_at"].eq(status_timestamp).all()
+        ):
             raise PriceDataValidationError(
                 f"Price retrieval coverage timestamp for {status.ticker} does not "
                 "match the incoming canonical rows."
@@ -1385,7 +1541,7 @@ def persist_price_history(
             raise ValueError("No price observations are available to persist.")
         successful_statuses: tuple[TickerDownloadStatus, ...] = ()
         if retrieval_statuses is not None:
-            successful_statuses = _validate_price_retrieval_statuses(
+            successful_statuses = validate_price_retrieval_statuses(
                 incoming, retrieval_statuses
             )
         if existing is not None and successful_statuses:

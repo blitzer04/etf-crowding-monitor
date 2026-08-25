@@ -666,6 +666,24 @@ def test_explicit_retrieved_at_is_exact_override_without_clock_lookup(
     assert (result.prices["retrieved_at"] == pd.Timestamp(RETRIEVED_AT)).all()
 
 
+def test_explicit_retrieved_at_preserves_nanoseconds_in_batch_metadata() -> None:
+    retrieved_at = pd.Timestamp("2024-11-29T18:01:02.987654321Z")
+
+    result = download_price_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-01-04",
+        downloader=lambda ticker, start, end: _single_ticker_frame(),
+        retrieved_at=retrieved_at,
+    )
+
+    assert result.statuses[0].retrieved_at == retrieved_at
+    assert isinstance(result.statuses[0].retrieved_at, pd.Timestamp)
+    assert result.retrieved_at == retrieved_at
+    assert isinstance(result.retrieved_at, pd.Timestamp)
+    assert result.prices["retrieved_at"].eq(retrieved_at).all()
+
+
 def test_explicit_retrieved_at_must_be_timezone_aware_before_download() -> None:
     downloader_called = False
 
@@ -976,6 +994,102 @@ def test_failed_ticker_status_records_error_and_continues() -> None:
     assert failed_status.rows_received == 0
     assert failed_status.error == "ConnectionError: synthetic provider outage"
     assert len(result.prices) == 2
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_message"),
+    [
+        pytest.param(TimeoutError(), "TimeoutError", id="empty-message"),
+        pytest.param(ValueError(" \t "), "ValueError", id="whitespace-message"),
+        pytest.param(
+            ValueError("  bad response  "),
+            "ValueError: bad response",
+            id="padded-message",
+        ),
+        pytest.param(
+            ConnectionError("ordinary failure"),
+            "ConnectionError: ordinary failure",
+            id="ordinary-message",
+        ),
+    ],
+)
+def test_downloader_normalizes_failed_status_error_messages(
+    error: Exception,
+    expected_message: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls = 0
+
+    def fake_download(ticker: str, start: date, end: date) -> pd.DataFrame:
+        nonlocal calls
+        del ticker, start, end
+        calls += 1
+        raise error
+
+    result = download_price_history(
+        ["SPY"],
+        start="2024-01-01",
+        end="2024-01-04",
+        downloader=fake_download,
+        retrieved_at=RETRIEVED_AT,
+    )
+
+    assert calls == 1
+    assert result.prices.empty
+    assert result.failed_tickers == ("SPY",)
+    status = result.statuses[0]
+    assert status.status == "failed"
+    assert status.rows_received == 0
+    assert status.first_date is None
+    assert status.last_date is None
+    assert status.returned_dates == ()
+    assert status.retrieved_at is None
+    assert type(status.error) is str
+    assert status.error == expected_message
+    assert status.error == status.error.strip()
+    assert expected_message in caplog.text
+
+
+def test_empty_message_failure_preserves_valid_partial_batch_and_persistence(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    call_counts = {"SPY": 0, "QQQ": 0}
+
+    def fake_download(ticker: str, start: date, end: date) -> pd.DataFrame:
+        del start, end
+        call_counts[ticker] += 1
+        if ticker == "QQQ":
+            raise TimeoutError()
+        return _single_ticker_frame()
+
+    result = download_price_history(
+        ["SPY", "QQQ"],
+        start="2024-01-01",
+        end="2024-01-04",
+        downloader=fake_download,
+        retrieved_at=RETRIEVED_AT,
+    )
+    persisted = persist_price_history(
+        result.prices,
+        tmp_path / "etf_prices_daily.parquet",
+        retrieval_statuses=result.statuses,
+    )
+
+    assert call_counts == {"SPY": 1, "QQQ": 1}
+    assert result.successful_tickers == ("SPY",)
+    assert result.failed_tickers == ("QQQ",)
+    failed_status = result.statuses[1]
+    assert failed_status.status == "failed"
+    assert failed_status.rows_received == 0
+    assert failed_status.first_date is None
+    assert failed_status.last_date is None
+    assert failed_status.returned_dates == ()
+    assert failed_status.retrieved_at is None
+    assert failed_status.error == "TimeoutError"
+    assert persisted.prices["ticker"].unique().tolist() == ["SPY"]
+    assert len(persisted.prices) == 2
+    assert "Price download failed for QQQ: TimeoutError" in caplog.text
 
 
 def test_malformed_provider_ticker_fails_while_valid_ticker_succeeds() -> None:

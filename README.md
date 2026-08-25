@@ -459,6 +459,75 @@ next XNYS session. Its history uses the current adjusted-price vintage and is
 exploratory rather than a point-in-time backtest. It is not a Crowding Score and
 does not replace deferred Flow or define a composite, weights, or thresholds.
 
+## Standalone signal evaluation workflow
+
+Day 8 adds an offline-first package workflow for evaluating the implemented
+standalone Momentum and Volatility components across the configured 24 ETFs.
+Reusable coverage, staleness, dependence, schema, and bundle logic lives in
+`etf_crowding.analysis`; the command-line script is a thin adapter.
+
+Offline mode is the default and requires an existing canonical price file:
+
+```text
+.venv\Scripts\python.exe scripts\evaluate_price_signals.py
+```
+
+If that file is absent, the command fails without creating a valid-looking
+empty evaluation. A live Yahoo price refresh is possible only through the
+explicit `--refresh` option and requires separate authorization before use:
+
+```text
+.venv\Scripts\python.exe scripts\evaluate_price_signals.py --refresh
+```
+
+The refresh path captures one UTC reference instant at nanosecond precision
+before acquisition and resolves the latest XNYS session whose scheduled close is
+not later than that instant. It requests history from `2018-01-01` through the
+calendar day after that target as an exclusive end and reuses the existing
+independent per-ticker acquisition and atomic canonical persistence APIs. It adds
+no project-level retry and preserves validated partial batches. Provider
+availability never moves the target backward: missing target inputs produce
+missing current results, while older price, raw-signal, and normalized-signal
+dates remain separately labeled stale diagnostics.
+
+When acquisition statuses are present, the workflow validates their exact
+ticker population, request bounds, outcome fields, returned dates, row counts,
+and UTC retrieval timestamps against the canonical rows claimed by the batch.
+Canonical and per-ticker retrieval timestamps retain nanosecond precision in
+coverage artifacts and manifest metadata.
+
+Each evaluation retains one coverage row for every configured ETF, including
+empty, failed, and entirely absent tickers. The workflow calls the public
+`calculate_momentum` and `calculate_volatility` APIs and retains their native
+outputs. Pearson and Spearman correlations use only exact `(ticker,
+signal_date)` pairs with both percentiles present. They are reported separately
+by ETF and by session, require at least three nonconstant pairs, contain no
+p-values or pooled estimate, and label session cross-sections as
+`full_universe` only when all 24 ETFs are present.
+
+Validated local run bundles are written under
+`data/processed/signal_evaluations/<UTC run ID>/` without overwriting an existing
+run. They contain immutable input prices, coverage, native Momentum, native
+Volatility, descriptive dependence diagnostics, and a provenance manifest. Each
+bundle is written in a sibling temporary directory, verified after Parquet
+reload with explicit Arrow schemas and hashes, and published only after the
+complete manifest passes validation. Before conversion, a holistic validator
+reconciles the canonical input, native signals, coverage, and dependence without
+repairing them. Git provenance is captured before any output path is created.
+After the directory rename, every final-path artifact and the manifest are
+reopened and revalidated; failures are quarantined rather than returned as valid
+runs. Modifications after the function returns cannot be prevented, so consumers
+must verify manifest hashes before use. Run bundles are generated local data;
+they are not automatically published or committed.
+
+Day 8.2 implemented and tested this workflow with synthetic data only. It did
+not execute `--refresh`, retrieve market data, or produce empirical ETF results.
+Any later historical output will use the then-current adjusted-price vintage,
+not a reconstruction of prior provider vintages. It is therefore exploratory,
+not a point-in-time backtest, and the present-day configured universe retains
+survivorship bias. Correlations are descriptive only and do not establish
+causality, predictive value, crowding, or suitability for a composite.
+
 ## Concentration status
 
 Day 7 approved methodology and completed official-source feasibility research;
@@ -504,7 +573,9 @@ source exists. Subsequent phases implemented the standalone Momentum and
 Volatility components and their audit diagnostics. Day 7 performed
 Concentration methodology design and official-source feasibility research and
 deferred implementation pending production-eligible holdings and
-economic-entity mapping.
+economic-entity mapping. Day 8 implements an offline-first standalone
+Momentum/Volatility evaluation and reproducible local bundle workflow; no live
+price refresh or empirical ETF analysis has been run.
 Pipeline implementation must not be confused with source suitability. The
 creation/redemption flow proxy, holdings ingestion, Concentration calculations,
 composite scores, backtests, analysis case studies, and Streamlit pages are not

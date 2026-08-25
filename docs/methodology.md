@@ -971,6 +971,154 @@ These are theoretical calendar dates, not empirical ETF coverage results. The
 repository currently has no canonical price dataset against which to establish
 actual ETF eligibility.
 
+## Standalone Momentum and Volatility evaluation workflow
+
+Day 8 implements a reusable offline-first workflow around the approved public
+Momentum and Volatility APIs. It does not alter, duplicate, or reinterpret either
+financial calculation. Momentum and Volatility remain separate price
+diagnostics, and their native outputs and missingness diagnostics remain intact.
+
+### Operating mode and target session
+
+Offline mode is the default. It loads the existing canonical price Parquet and
+makes no provider request. Absence of the canonical file is an error and must not
+produce an empty bundle that resembles a valid evaluation.
+
+Refresh mode requires the explicit `--refresh` command-line option or an
+explicit `refresh=True` reusable-API argument. Capture one timezone-aware instant
+before any acquisition, normalize it to UTC, and preserve its nanosecond
+precision through the in-memory result and manifest. With the pinned
+`exchange-calendars==4.13.2` XNYS schedule, define the target as:
+
+```text
+d_t = latest XNYS session whose scheduled close <= captured UTC instant
+```
+
+Apply no post-close grace period. The provider request begins on `2018-01-01`
+inclusive and uses the calendar day immediately after `d_t` as its explicit
+exclusive end. The workflow invokes the existing independent per-ticker price
+adapter once for every configured ETF and adds no retry loop. Existing canonical
+validation, partial-batch behavior, coverage metadata, source-vintage merging,
+revision snapshots, locking, and atomic persistence remain unchanged.
+
+Offline evaluation may contain no acquisition-status collection. Whenever
+statuses are supplied, the shared canonical price-retrieval validator requires
+exact configured-universe coverage, one common request window matching the
+evaluation bounds, strict success/empty/failed fields, and exact reconciliation
+of successful returned dates, row counts, and UTC retrieval timestamps to the
+canonical acquisition rows. The validator does not infer or repair incorrect
+metadata. Canonical retrieval timestamps and their per-ticker extrema retain
+UTC nanosecond precision through coverage, Parquet, and manifest serialization.
+
+Failure or delay in publishing the target observation does not move `d_t`
+backward. A current value exists only when the native component output is
+eligible on `d_t`. Older observations may be retained only as separately labeled
+diagnostics. Price staleness, raw-signal staleness, and normalized-signal
+staleness are each the count of XNYS sessions after the applicable latest date
+through `d_t`; missing histories have missing staleness rather than an invented
+age.
+
+### Coverage and component diagnostics
+
+The evaluation input is the validated canonical slice for configured ETFs from
+`2018-01-01` through `d_t`, inclusive. Calendar alignment creates no price rows.
+Coverage output contains exactly one row for every configured ETF in
+configuration order, even when that ETF was empty, failed acquisition, or is
+entirely absent from the canonical input.
+
+For each ETF, retain:
+
+- request and acquisition metadata where available;
+- first and last canonical and nonmissing adjusted-close dates;
+- expected and present XNYS counts, exact missing canonical dates, and exact
+  present-row/missing-`adjusted_close` dates;
+- target price-row and adjusted-close availability;
+- first and last eligible raw and normalized dates for each component;
+- target raw and normalized eligibility, native target status, normalization
+  status, reference count, and financial values where available; and
+- separate price, raw-component, and normalized-component XNYS staleness.
+
+An absent or ineligible value remains missing. Do not represent it as zero,
+neutrality, an older current value, a substitute component, or an automatically
+redistributed value. Exact endpoint and chain reasons remain in the native
+Momentum and Volatility artifacts.
+
+### Descriptive dependence diagnostics
+
+Dependence uses only an exact inner join on `(ticker, signal_date)` where both
+native normalized percentiles are present. Do not pair different sessions,
+carry observations forward, or fill either component.
+
+Report Pearson and Spearman correlations separately:
+
+- for every configured ETF across its exact-date overlaps; and
+- for every XNYS session across the ETFs with an exact-date overlap.
+
+An estimate requires at least three pairs and at least two distinct values in
+each input. Otherwise the estimate remains missing with deterministic status
+`insufficient_pairs` or `constant_input`. Each row records its pair count,
+applicable first and last dates, estimator, scope, ETF or session key, and
+included tickers. A session is `full_universe` only when all 24 configured ETFs
+are included; every other session is `incomplete_universe`.
+
+Do not calculate p-values or a pooled correlation. These estimates are
+descriptive co-movement diagnostics only. They do not establish causality,
+predictive value, crowding, investor positioning, future returns, or suitability
+for a composite.
+
+### Transactional local run bundle
+
+The default output root is `data/processed/signal_evaluations/`. Every run uses a
+microsecond-resolution UTC run ID and a new non-overwriting directory containing:
+
+- `input_prices.parquet`: immutable copy of the exact canonical slice used;
+- `coverage.parquet`: the configured-universe coverage and staleness contract;
+- `momentum.parquet`: native Momentum output;
+- `volatility.parquet`: native Volatility output;
+- `dependence.parquet`: descriptive exact-date correlations; and
+- `manifest.json`: timing, Git, command, version, universe, acquisition, schema,
+  row-count, filename, and SHA-256 provenance.
+
+Before pandas-to-Arrow conversion, a holistic non-mutating validator checks the
+canonical input and regenerates the native signals, coverage, and dependence
+through the approved package calculations. Exact equality is required, including
+keys, dtypes, values, null masks, statuses, dates, counts, staleness, and
+cross-artifact relationships. Present non-finite values are rejected rather than
+silently converted to Arrow nulls. Git HEAD and dirty state are captured before
+creating any output directory or artifact.
+
+Parquet artifacts use explicit deterministic Arrow schemas. Diagnostic date
+collections use Arrow lists of nanosecond timestamps. Before publication, every
+artifact is reloaded and compared losslessly for values, nulls, exact dates,
+counts, ordering, statuses, collections, and schema. Hashes are calculated only
+after successful reload. The manifest does not contain its own hash and is
+reloaded and checked against every artifact.
+
+All files are first written below a sibling temporary directory. Only after all
+validation succeeds is that directory renamed to the final previously nonexistent
+run path. The manifest and every artifact are then reopened from the final path;
+hashes, schemas, counts, semantic equivalence, manifest relationships, and the
+holistic evaluation contract are checked again before success is returned. A
+failed final-path check is quarantined under a clearly invalid sibling name and
+is not returned as a valid run. Modifications after return cannot be prevented,
+so every consumer must verify manifest hashes before using a bundle. Bundles are
+local generated data and are not automatically published or committed.
+
+### Historical and interpretation limitations
+
+The immutable input artifact preserves the exact adjusted-price vintage used by
+that run, but it does not reconstruct the price vintage or publication timing
+that existed on each historical signal date. Historical signal paths and their
+correlations therefore remain exploratory current-vintage analysis, not a
+point-in-time backtest. The present-day configured ETF universe also introduces
+survivorship bias.
+
+Day 8.2 used deterministic synthetic data to implement and test the workflow. It
+did not execute refresh mode, retrieve market data, or produce empirical ETF
+results. Flow and Concentration remain deferred. Do not define a composite,
+component weights, thresholds, risk classes, missing-component reweighting, or a
+Crowding Score.
+
 ## Composite score status
 
 No historical or current composite has been approved. Flow and Concentration
