@@ -8,10 +8,16 @@ and the intended research design for the U.S. ETF Crowding & Overheating Risk
 Monitor. No Flow or Concentration component is implemented, and no composite
 score, threshold set, or point-in-time backtest exists at this stage. Momentum
 and Volatility are standalone diagnostic components, and neither is a Crowding
-Score. One
-controlled current-vintage price-signal evaluation was completed and audited on
-2026-08-25; its bounded empirical record is documented in
-[`price-signal-empirical-audit-2026-08-25.md`](price-signal-empirical-audit-2026-08-25.md).
+Score. Two controlled current-vintage price-signal evaluations have been
+completed and audited. The Day 9 run targeted 2026-08-24 and had complete
+target-session standalone Momentum and Volatility. The Day 11 run targeted
+2026-08-28; all 24 canonical target rows exist, but `close` and
+`adjusted_close` are missing, so target-session Momentum and Volatility remain
+unavailable and one XNYS session stale. Their bounded empirical records are
+documented in
+[`price-signal-empirical-audit-2026-08-25.md`](price-signal-empirical-audit-2026-08-25.md)
+and
+[`price-signal-second-vintage-audit-2026-08-31.md`](price-signal-second-vintage-audit-2026-08-31.md).
 
 Flow is deferred from both historical and current scores because the current
 shares source did not pass the approved event-time acceptance specification.

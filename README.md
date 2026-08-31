@@ -85,6 +85,9 @@ recorded in
 The controlled 2026-08-25 price refresh and independent artifact audit are
 recorded in
 [`docs/price-signal-empirical-audit-2026-08-25.md`](docs/price-signal-empirical-audit-2026-08-25.md).
+The controlled 2026-08-31 second-vintage refresh, revision comparison,
+missing-target outcome, and two-run dashboard acceptance are recorded in
+[`docs/price-signal-second-vintage-audit-2026-08-31.md`](docs/price-signal-second-vintage-audit-2026-08-31.md).
 
 Historical daily price ingestion/persistence, historical shares-outstanding
 ingestion/persistence, and the standalone Momentum and Volatility components
@@ -92,9 +95,9 @@ are implemented. This describes pipeline and calculation availability, not
 empirical suitability of the current shares source for Flow scoring. The
 creation/redemption flow proxy and Concentration component remain deferred.
 Holdings ingestion, Concentration calculations, composite scores, and backtests
-are not implemented. One dated current-vintage
-Momentum/Volatility evaluation has been completed and independently audited;
-it is exploratory evidence, not a point-in-time backtest or a composite result.
+are not implemented. Two dated current-vintage Momentum/Volatility evaluations
+have been completed and independently audited; they are exploratory evidence,
+not point-in-time backtests or composite results.
 The local dashboard only reads a separately selected, fully verified evaluation
 bundle and does not create a score or refresh data.
 
@@ -542,8 +545,8 @@ causality, predictive value, crowding, or suitability for a composite.
 
 ### Local signal-bundle dashboard
 
-Day 10 adds a local-only, read-only viewer for the existing six-file Day 9
-signal-evaluation contract. It discovers direct-child run directory names but
+Day 10 adds a local-only, read-only viewer for the six-file signal-evaluation
+contract. It discovers direct-child run directory names but
 starts with a blank selection and never silently selects the newest or an older
 run. Before any financial value is displayed, the consumer snapshots the exact
 six regular files, hashes them, parses those same bytes, and verifies the
@@ -622,6 +625,12 @@ completed one controlled live price refresh and an independent read-only audit
 of its local Git-ignored artifacts; the resulting analysis is current-vintage
 and exploratory rather than a point-in-time backtest. Day 10 implements the
 fail-closed local Streamlit viewer for an explicitly selected verified bundle.
+Day 11 adds a second controlled current-vintage evaluation and a two-run
+read-only dashboard acceptance audit. The declared 2026-08-28 target remained
+fixed: all 24 canonical target rows exist, but `close` and `adjusted_close` are
+missing for an unresolved source-side reason. The workflow intentionally
+preserved that target and missingness without fallback, carry-forward, filling,
+or substitution.
 Pipeline implementation must not be confused with source suitability. The
 creation/redemption flow proxy, holdings ingestion, Concentration calculations,
 composite scores, point-in-time backtests, production analysis case studies, and
