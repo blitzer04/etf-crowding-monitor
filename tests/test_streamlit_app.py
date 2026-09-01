@@ -804,7 +804,10 @@ def test_provenance_view_exposes_required_fixed_run_evidence(
         "Captured evaluation instant",
         "Request end (exclusive)",
         "Pre-run worktree dirty",
-        "Universe-config SHA-256",
+        "Effective universe definitions SHA-256",
+        "The stored manifest field `universe_config_sha256` is the SHA-256 of the "
+        "deterministic JSON serialization of the effective parsed ETF definitions "
+        "in configured order, not the raw YAML resource bytes.",
         "Verified from exact snapshotted bytes",
         "Manifest computed SHA-256",
         "Current-vintage history",
@@ -821,6 +824,7 @@ def test_provenance_view_exposes_required_fixed_run_evidence(
         "reweighting, or Crowding Score exists",
     ):
         assert required in combined
+    assert "Universe-config SHA-256" not in combined
     artifact_table = next(
         cast(pd.DataFrame, element.value)
         for element in app.table

@@ -36,14 +36,22 @@ appears.
   including pair counts, dates, included populations, estimator status, and
   universe status. It contains no p-values or pooled estimate.
 - **Provenance and limitations:** run timing, Git state, evaluation and viewer
-  versions, the universe-config hash, exactly six artifact rows, schemas,
-  expected and computed hashes, consumer verification status, and the
-  current-vintage, point-in-time, survivorship, provider-revision, rights, and
-  interpretation boundaries. The manifest digest is computed for the exact
-  snapshot but is not internally self-authenticating because the manifest is
-  unsigned and could be replaced with all five Parquet artifacts.
+  versions, the effective ordered parsed universe-definitions hash, exactly six
+  artifact rows, schemas, expected and computed hashes, consumer verification
+  status, and the current-vintage, point-in-time, survivorship,
+  provider-revision, rights, and interpretation boundaries. The stored manifest
+  field remains `universe_config_sha256`; it is the SHA-256 of the deterministic
+  JSON serialization of the effective parsed ETF definitions in configured
+  order, not the raw packaged or external YAML resource bytes. The manifest
+  digest is computed for the exact snapshot but is not internally
+  self-authenticating because the manifest is unsigned and could be replaced
+  with all five Parquet artifacts.
 
 ## Operating boundary
+
+The controlled manual price-refresh procedure, including authorization,
+retention, failure, and post-run verification, is documented in
+[`../docs/price-signal-operations.md`](../docs/price-signal-operations.md).
 
 The app is a fixed-run viewer, not a live monitor. It has no provider call,
 refresh button, export/download, public hosting, derived persistence, repair,

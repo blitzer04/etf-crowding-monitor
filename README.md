@@ -477,6 +477,10 @@ standalone Momentum and Volatility components across the configured 24 ETFs.
 Reusable coverage, staleness, dependence, schema, and bundle logic lives in
 `etf_crowding.analysis`; the command-line script is a thin adapter.
 
+The reusable manual preflight, exactly-once refresh, retention, failure, and
+post-run verification procedure is in
+[`docs/price-signal-operations.md`](docs/price-signal-operations.md).
+
 Offline mode is the default and requires an existing canonical price file:
 
 ```text

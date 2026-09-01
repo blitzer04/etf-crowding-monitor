@@ -411,14 +411,14 @@ def build_adjusted_price_figure(
 def _render_table(frame: pd.DataFrame) -> None:
     if "hide_index" in signature(st.table).parameters:
         st.table(frame, hide_index=True)
-    else:  # Streamlit 1.33 compatibility.
+    else:  # Compatibility with supported signatures lacking hide_index.
         st.table(frame)
 
 
 def _render_figure(figure: go.Figure) -> None:
     if "width" in signature(st.plotly_chart).parameters:
         st.plotly_chart(figure, width="stretch", config=_CHART_CONFIG)
-    else:  # Streamlit 1.33 compatibility.
+    else:  # Compatibility with supported signatures lacking width.
         st.plotly_chart(figure, use_container_width=True, config=_CHART_CONFIG)
 
 
@@ -975,7 +975,7 @@ def render_provenance(bundle: VerifiedSignalEvaluationBundle) -> None:
                 "Evaluation mode",
                 "Git commit",
                 "Pre-run worktree dirty",
-                "Universe-config SHA-256",
+                "Effective universe definitions SHA-256",
                 "Bundle verification",
                 "Combined six-file snapshot SHA-256",
                 "Manifest computed SHA-256",
@@ -997,6 +997,11 @@ def render_provenance(bundle: VerifiedSignalEvaluationBundle) -> None:
         }
     )
     _render_table(run_metadata)
+    st.caption(
+        "The stored manifest field `universe_config_sha256` is the SHA-256 of the "
+        "deterministic JSON serialization of the effective parsed ETF definitions "
+        "in configured order, not the raw YAML resource bytes."
+    )
 
     st.subheader(
         "Evaluation package versions",
