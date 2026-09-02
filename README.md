@@ -682,6 +682,20 @@ mypy src/etf_crowding app
 pytest
 ```
 
+## Continuous integration
+
+The read-only `CI` workflow runs for pushes to `main`, pull requests targeting
+`main`, and manual dispatch. It checks the tracked repository with Python 3.12
+on Windows and Ubuntu, running pip dependency integrity, Ruff lint and format,
+mypy, and the full synthetic/offline pytest suite.
+
+Hosted CI has read-only repository permission. It performs no data refresh,
+provider request, persistence, dashboard launch, deployment, or export. Hosted
+runners do not contain the Git-ignored canonical datasets or real evaluation
+bundles, so the clean-checkout real-bundle test skips explicitly. The completed
+local real-bundle and Browser acceptance audits remain separate evidence and
+are not replaced by CI. No public deployment has been approved.
+
 ## Disclaimer
 
 This project is for research and educational purposes only. It is not investment
