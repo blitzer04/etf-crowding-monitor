@@ -20,8 +20,8 @@ from typing import Any, Literal, cast
 import exchange_calendars as xcals  # type: ignore[import-untyped]
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
+import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 from pandas.api.types import (
     is_any_real_numeric_dtype,
     is_bool_dtype,
