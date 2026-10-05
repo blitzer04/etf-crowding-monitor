@@ -605,7 +605,7 @@ for the evidence boundary and unexecuted validation plan.
 ## Technology stack
 
 - Python 3.12
-- pandas, NumPy, SciPy, and statsmodels for data and statistical work
+- pandas, NumPy, and SciPy for data and statistical work
 - exchange-calendars 4.13.2 for the pinned XNYS reference-session calendar
 - yfinance 1.5.2 as the pinned historical price and shares-data interface
 - PyYAML and PyArrow for configuration and data storage
@@ -667,7 +667,11 @@ python -m pip install -e ".[dev]"
 ```
 
 On macOS or Linux, activate the environment with
-`source .venv/bin/activate`. Alternatively, `python -m pip install -r
+`source .venv/bin/activate`. Command examples in this repository use Windows
+paths; on macOS or Linux, replace `.venv\Scripts\python.exe` with
+`.venv/bin/python` and use forward slashes, for example
+`.venv/bin/python -m streamlit run app/streamlit_app.py --server.address 127.0.0.1`.
+Alternatively, `python -m pip install -r
 requirements.txt` installs the same production and development dependency sets
 without installing the local package.
 

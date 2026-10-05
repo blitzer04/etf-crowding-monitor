@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import cast
 
-import streamlit as st
+# ``streamlit run app/streamlit_app.py`` places only ``app/`` on ``sys.path``.
+# The presentation layer is imported as the ``app`` package, so the repository
+# root must be importable regardless of how Streamlit was launched.
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
 
-from app.signal_dashboard import (
+import streamlit as st  # noqa: E402
+
+from app.signal_dashboard import (  # noqa: E402
     VIEW_NAMES,
     render_dependence,
     render_etf_detail,
@@ -15,14 +23,14 @@ from app.signal_dashboard import (
     render_provenance,
     render_verified_context,
 )
-from etf_crowding.analysis import (
+from etf_crowding.analysis import (  # noqa: E402
     DEFAULT_SIGNAL_BUNDLE_DIRNAME,
     SignalBundleError,
     VerifiedSignalEvaluationBundle,
     discover_signal_evaluation_runs,
     load_signal_evaluation_bundle,
 )
-from etf_crowding.paths import get_processed_data_dir
+from etf_crowding.paths import get_processed_data_dir  # noqa: E402
 
 _VERIFIED_STATE_KEY = "signal_dashboard_verified_bundle"
 _SELECTION_STATE_KEY = "signal_dashboard_selected_run"
