@@ -2,7 +2,7 @@
 
 ## Project Purpose
 
-This repository is the **U.S. ETF Crowding & Overheating Risk Monitor**, a quantitative-finance research project and public Streamlit application. Use Python 3.12. Treat methodological correctness, point-in-time data integrity, reproducibility, and clear communication of limitations as core product requirements.
+This repository is the **U.S. ETF Crowding & Overheating Risk Monitor**, a quantitative-finance research project with a local-only Streamlit viewer. Public deployment has not been approved. Use Python 3.12. Treat methodological correctness, point-in-time data integrity, reproducibility, and clear communication of limitations as core product requirements.
 
 ## Repository Organization
 

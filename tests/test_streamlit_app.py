@@ -4,8 +4,11 @@ import ast
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
+import subprocess
+import sys
 import tomllib
 from datetime import UTC, datetime, timedelta
 from functools import cache
@@ -1256,3 +1259,33 @@ def test_manifest_is_synthetic_and_contains_no_provider_payload_copy(
         dict[str, object], json.loads(manifest_path.read_text(encoding="utf-8"))
     )
     assert manifest["command_arguments"] == ["--prices", "synthetic-app.parquet"]
+
+
+def test_entry_point_imports_when_only_app_directory_is_on_path(
+    tmp_path: Path,
+) -> None:
+    project_root = APP_PATH.parents[1]
+    # ``streamlit run app/streamlit_app.py`` executes the script with only its
+    # own directory on ``sys.path``; the working directory is not importable.
+    script = (
+        "import runpy, sys; "
+        f"sys.path[0] = {str(APP_PATH.parent)!r}; "
+        f"runpy.run_path({str(APP_PATH)!r}, run_name='entry_point_import_check')"
+    )
+    environment = {
+        **os.environ,
+        "PYTHONPATH": str(project_root / "src"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
